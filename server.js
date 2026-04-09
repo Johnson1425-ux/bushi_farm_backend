@@ -386,12 +386,19 @@ app.get('/api/public/stats', async (req, res) => {
 });
 
 /* ══════════════════════════════════
-   START
+   START (Updated for Vercel)
 ══════════════════════════════════ */
-const PORT = process.env.PORT || 3001;
-initDB().then(() => {
-  app.listen(PORT, () => console.log(`✓ MilkTrack API running on http://localhost:${PORT}`));
-}).catch(err => {
-  console.error('Failed to connect to database:', err.message);
-  process.exit(1);
-});
+
+// 1. Initialize the DB immediately (top level)
+initDB().catch(err => console.error('DB Init Error:', err.message));
+
+// 2. EXPORT the app (Mandatory for Vercel)
+module.exports = app;
+
+// 3. ONLY listen if running locally
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`✓ MilkTrack API running on http://localhost:${PORT}`);
+  });
+}
