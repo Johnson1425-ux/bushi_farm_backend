@@ -41,6 +41,37 @@ async function initDB() {
 
       CREATE INDEX IF NOT EXISTS idx_milk_records_cow_id ON milk_records(cow_id);
       CREATE INDEX IF NOT EXISTS idx_milk_records_date   ON milk_records(date);
+
+      CREATE TABLE IF NOT EXISTS inventory_items (
+        id            SERIAL PRIMARY KEY,
+        name          TEXT NOT NULL UNIQUE,
+        unit          TEXT NOT NULL DEFAULT 'pcs',
+        current_stock NUMERIC NOT NULL DEFAULT 0,
+        notes         TEXT,
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+      
+      CREATE TABLE IF NOT EXISTS inventory_logs (
+        id         SERIAL PRIMARY KEY,
+        item_id    INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+        type       TEXT NOT NULL CHECK(type IN ('in','out')),
+        quantity   NUMERIC NOT NULL,
+        date       DATE NOT NULL,
+        notes      TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_inv_logs_item ON inventory_logs(item_id);
+      CREATE INDEX IF NOT EXISTS idx_inv_logs_date ON inventory_logs(date);
+      
+      CREATE TABLE IF NOT EXISTS sales (
+        id              SERIAL PRIMARY KEY,
+        date            DATE NOT NULL,
+        litres_sold     NUMERIC NOT NULL,
+        price_per_litre NUMERIC NOT NULL DEFAULT 0,
+        notes           TEXT,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(date);
     `);
 
     /* Seed a default admin if no users exist yet */
