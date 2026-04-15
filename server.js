@@ -387,6 +387,447 @@ app.get('/api/public/stats', async (req, res) => {
   }
 });
 
+
+/* ══════════════════════════════════
+   INVENTORY ITEMS
+══════════════════════════════════ */
+ 
+// GET /api/inventory/items
+app.get('/api/inventory/items', verifyToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        i.*,
+        COALESCE(SUM(CASE WHEN l.type='in'  THEN l.quantity ELSE 0 END), 0) AS total_in,
+        COALESCE(SUM(CASE WHEN l.type='out' THEN l.quantity ELSE 0 END), 0) AS total_out
+      FROM inventory_items i
+      LEFT JOIN inventory_logs l ON l.item_id = i.id
+      GROUP BY i.id
+      ORDER BY i.name
+    `);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+// POST /api/inventory/items
+app.post('/api/inventory/items', verifyToken, requireAdmin, async (req, res) => {
+  const { name, unit = 'pcs', current_stock = 0, notes } = req.body;
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO inventory_items (name, unit, current_stock, notes)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [name.trim(), unit, current_stock, notes || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Item already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+// PATCH /api/inventory/items/:id
+app.patch('/api/inventory/items/:id', verifyToken, requireAdmin, async (req, res) => {
+  const { name, unit, notes } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE inventory_items
+       SET name  = COALESCE($1, name),
+           unit  = COALESCE($2, unit),
+           notes = COALESCE($3, notes)
+       WHERE id=$4 RETURNING *`,
+      [name || null, unit || null, notes || null, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+// DELETE /api/inventory/items/:id
+app.delete('/api/inventory/items/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM inventory_items WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+/* ══════════════════════════════════
+   INVENTORY LOGS
+══════════════════════════════════ */
+ 
+// GET /api/inventory/logs?item_id=&from=&to=
+app.get('/api/inventory/logs', verifyToken, async (req, res) => {
+  const { item_id, from, to } = req.query;
+  const conditions = [], params = [];
+  if (item_id) { params.push(item_id); conditions.push(`l.item_id=$${params.length}`); }
+  if (from)    { params.push(from);    conditions.push(`l.date>=$${params.length}`); }
+  if (to)      { params.push(to);      conditions.push(`l.date<=$${params.length}`); }
+  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+  try {
+    const { rows } = await pool.query(`
+      SELECT l.*, i.name AS item_name, i.unit,
+             TO_CHAR(l.date,'YYYY-MM-DD') AS date
+      FROM inventory_logs l
+      JOIN inventory_items i ON i.id = l.item_id
+      ${where}
+      ORDER BY l.date DESC, l.id DESC
+    `, params);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+// POST /api/inventory/logs
+app.post('/api/inventory/logs', verifyToken, requireAdmin, async (req, res) => {
+  const { item_id, type, quantity, date, notes } = req.body;
+  if (!item_id || !type || !quantity || !date)
+    return res.status(400).json({ error: 'item_id, type, quantity, date required' });
+  if (!['in','out'].includes(type))
+    return res.status(400).json({ error: "type must be 'in' or 'out'" });
+ 
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO inventory_logs (item_id, type, quantity, date, notes)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [item_id, type, quantity, date, notes || null]
+    );
+    const delta = type === 'in' ? quantity : -quantity;
+    await client.query(
+      `UPDATE inventory_items SET current_stock = current_stock + $1 WHERE id=$2`,
+      [delta, item_id]
+    );
+    await client.query('COMMIT');
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+ 
+/* ══════════════════════════════════
+   INVENTORY — EXCEL IMPORT
+   Columns: ITEM | TYPE | QUANTITY | DATE | NOTES
+══════════════════════════════════ */
+app.post('/api/inventory/import', verifyToken, requireAdmin, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb   = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const ws   = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    if (!rows.length) return res.status(400).json({ error: 'Empty file' });
+ 
+    const client = await pool.connect();
+    let imported = 0;
+    const errors = [];
+    try {
+      await client.query('BEGIN');
+      for (const [i, row] of rows.entries()) {
+        const rowNum   = i + 2;
+        const itemName = String(row['ITEM'] ?? row['item'] ?? row['Item'] ?? '').trim();
+        const type     = String(row['TYPE'] ?? row['type'] ?? row['Type'] ?? '').trim().toLowerCase();
+        const qty      = parseFloat(String(row['QUANTITY'] ?? row['quantity'] ?? row['Quantity'] ?? 0).replace(',','.'));
+        const dateRaw  = row['DATE'] ?? row['date'] ?? row['Date'] ?? '';
+        const notes    = String(row['NOTES'] ?? row['notes'] ?? row['Notes'] ?? '').trim() || null;
+ 
+        if (!itemName || !type || !qty || !dateRaw) {
+          errors.push(`Row ${rowNum}: missing required field (ITEM, TYPE, QUANTITY, DATE)`);
+          continue;
+        }
+        if (!['in','out'].includes(type)) {
+          errors.push(`Row ${rowNum}: TYPE must be 'in' or 'out', got '${type}'`);
+          continue;
+        }
+        const date = parseDate(dateRaw);
+        if (!date) { errors.push(`Row ${rowNum}: invalid DATE '${dateRaw}'`); continue; }
+ 
+        // Find or create item
+        const itemRes = await client.query(
+          `INSERT INTO inventory_items (name) VALUES ($1)
+           ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
+          [itemName]
+        );
+        const item_id = itemRes.rows[0].id;
+ 
+        await client.query(
+          `INSERT INTO inventory_logs (item_id, type, quantity, date, notes)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [item_id, type, qty, date, notes]
+        );
+        const delta = type === 'in' ? qty : -qty;
+        await client.query(
+          `UPDATE inventory_items SET current_stock = current_stock + $1 WHERE id=$2`,
+          [delta, item_id]
+        );
+        imported++;
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ success: true, imported, errors });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+/* ══════════════════════════════════
+   INVENTORY — EXCEL EXPORT
+══════════════════════════════════ */
+app.get('/api/inventory/export', verifyToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT TO_CHAR(l.date,'YYYY-MM-DD') AS "DATE",
+             i.name AS "ITEM", i.unit AS "UNIT",
+             l.type AS "TYPE", l.quantity AS "QUANTITY", l.notes AS "NOTES"
+      FROM inventory_logs l JOIN inventory_items i ON i.id=l.item_id
+      ORDER BY l.date DESC
+    `);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Inventory Logs');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Disposition', 'attachment; filename="inventory_logs.xlsx"');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buf);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+/* ══════════════════════════════════
+   SALES
+══════════════════════════════════ */
+ 
+// GET /api/sales?from=&to=&month=YYYY-MM
+app.get('/api/sales', verifyToken, async (req, res) => {
+  const { from, to, month } = req.query;
+  const conditions = [], params = [];
+  if (month) {
+    params.push(month);
+    conditions.push(`TO_CHAR(date,'YYYY-MM')=$${params.length}`);
+  } else {
+    if (from) { params.push(from); conditions.push(`date>=$${params.length}`); }
+    if (to)   { params.push(to);   conditions.push(`date<=$${params.length}`); }
+  }
+  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+  try {
+    const { rows } = await pool.query(`
+      SELECT id,
+             TO_CHAR(date,'YYYY-MM-DD') AS date,
+             litres_sold, price_per_litre,
+             ROUND((litres_sold * price_per_litre)::numeric, 2) AS total,
+             notes, created_at
+      FROM sales ${where}
+      ORDER BY date DESC
+    `, params);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+// POST /api/sales
+app.post('/api/sales', verifyToken, requireAdmin, async (req, res) => {
+  const { date, litres_sold, price_per_litre, notes } = req.body;
+  if (!date || !litres_sold || !price_per_litre)
+    return res.status(400).json({ error: 'date, litres_sold, price_per_litre required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO sales (date, litres_sold, price_per_litre, notes)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT DO NOTHING RETURNING *`,
+      [date, litres_sold, price_per_litre, notes || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+// DELETE /api/sales/:id
+app.delete('/api/sales/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM sales WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+// GET /api/sales/summary  — totals grouped by month
+app.get('/api/sales/summary', verifyToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        TO_CHAR(date,'YYYY-MM') AS month,
+        COUNT(*)::int AS record_count,
+        ROUND(SUM(litres_sold)::numeric, 2) AS total_litres,
+        ROUND(SUM(litres_sold * price_per_litre)::numeric, 2) AS total_revenue,
+        ROUND(AVG(litres_sold)::numeric, 2) AS avg_litres_per_day
+      FROM sales
+      GROUP BY TO_CHAR(date,'YYYY-MM')
+      ORDER BY month DESC
+    `);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+/* ══════════════════════════════════
+   SALES — EXCEL IMPORT
+   Same monthly grid format as milk records
+   Columns: DATE | LITRES | PRICE_PER_LITRE | NOTES
+   OR monthly grid: rows=days (1-31), cols per month
+══════════════════════════════════ */
+app.post('/api/sales/import', verifyToken, requireAdmin, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb   = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const ws   = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    if (!rows.length) return res.status(400).json({ error: 'Empty file' });
+ 
+    const sample = rows[0];
+    const hasDateCol = findKey(sample, ['date']);
+ 
+    // ── Format A: DATE | LITRES | PRICE_PER_LITRE | NOTES ──
+    if (hasDateCol) {
+      const client = await pool.connect();
+      let imported = 0;
+      const errors = [];
+      try {
+        await client.query('BEGIN');
+        for (const [i, row] of rows.entries()) {
+          const rowNum = i + 2;
+          const dateRaw = row[findKey(row, ['date'])] ?? '';
+          const litres  = parseFloat(String(row[findKey(row, ['litre','liter','qty','litres'])] ?? 0).replace(',','.'));
+          const price   = parseFloat(String(row[findKey(row, ['price','ppl','rate'])] ?? 0).replace(',','.'));
+          const notes   = String(row[findKey(row, ['notes','note','remarks'])] ?? '').trim() || null;
+ 
+          const date = parseDate(dateRaw);
+          if (!date || isNaN(litres) || litres <= 0 || isNaN(price) || price <= 0) {
+            errors.push(`Row ${rowNum}: invalid or missing values`);
+            continue;
+          }
+          await client.query(
+            `INSERT INTO sales (date, litres_sold, price_per_litre, notes)
+             VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+            [date, litres, price, notes]
+          );
+          imported++;
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+      return res.json({ success: true, imported, errors });
+    }
+ 
+    // ── Format B: monthly grid (day columns 1-31) ──
+    // Uses same detection logic as /api/import for milk
+    const headerRow = rows[0];
+    const dayColumns = [];
+    Object.keys(headerRow).forEach(col => {
+      const day = parseInt(col);
+      if (!isNaN(day) && day >= 1 && day <= 31) dayColumns.push({ day, col });
+    });
+    if (!dayColumns.length)
+      return res.status(400).json({ error: 'Could not detect format. Use DATE|LITRES|PRICE_PER_LITRE or monthly grid.' });
+ 
+    const priceKey  = findKey(sample, ['price','ppl','rate']);
+    const globalPrice = priceKey ? parseFloat(String(sample[priceKey]).replace(',','.')) : 0;
+ 
+    let year = new Date().getFullYear(), month = new Date().getMonth() + 1;
+    const name = req.file.originalname.toLowerCase();
+    const monthMap = {january:1,february:2,march:3,april:4,may:5,june:6,july:7,august:8,september:9,october:10,november:11,december:12};
+    for (const m in monthMap) { if (name.includes(m)) { month = monthMap[m]; break; } }
+    const yearMatch = name.match(/20\d{2}/);
+    if (yearMatch) year = parseInt(yearMatch[0]);
+ 
+    const client = await pool.connect();
+    let imported = 0;
+    const errors = [];
+    try {
+      await client.query('BEGIN');
+      for (const row of rows) {
+        const rowPrice = findKey(row, ['price','ppl','rate'])
+          ? parseFloat(String(row[findKey(row, ['price','ppl','rate'])]).replace(',','.'))
+          : globalPrice;
+        if (!rowPrice || isNaN(rowPrice)) { errors.push('Missing price_per_litre'); continue; }
+ 
+        for (const { day, col } of dayColumns) {
+          let val = row[col];
+          if (typeof val === 'string') val = val.replace(',','.');
+          const litres = parseFloat(val);
+          if (isNaN(litres) || litres <= 0) continue;
+          const date = `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+          await client.query(
+            `INSERT INTO sales (date, litres_sold, price_per_litre)
+             VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+            [date, litres, rowPrice]
+          );
+          imported++;
+        }
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ success: true, imported, errors, detected_month: month, detected_year: year });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+/* ══════════════════════════════════
+   SALES — EXCEL EXPORT
+══════════════════════════════════ */
+app.get('/api/sales/export', verifyToken, async (req, res) => {
+  const { month } = req.query;
+  const conditions = [], params = [];
+  if (month) { params.push(month); conditions.push(`TO_CHAR(date,'YYYY-MM')=$${params.length}`); }
+  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+  try {
+    const { rows } = await pool.query(`
+      SELECT TO_CHAR(date,'YYYY-MM-DD') AS "DATE",
+             litres_sold AS "LITRES_SOLD",
+             price_per_litre AS "PRICE_PER_LITRE",
+             ROUND((litres_sold * price_per_litre)::numeric,2) AS "TOTAL",
+             notes AS "NOTES"
+      FROM sales ${where}
+      ORDER BY date DESC
+    `, params);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Sales');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Disposition', 'attachment; filename="sales.xlsx"');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buf);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ══════════════════════════════════
    START (Updated for Vercel)
 ══════════════════════════════════ */
