@@ -203,6 +203,22 @@ app.get('/api/records', verifyToken, async (req, res) => {
   }
 });
 
+
+app.post('/api/records', verifyToken, async (req, res) => {
+  const { cow_id, date, litres } = req.body;
+  if (!cow_id || !date || litres === undefined) return res.status(400).json({ error: 'cow_id, date and litres are required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO milk_records(cow_id, date, litres)
+       VALUES($1, $2, $3)
+       ON CONFLICT (cow_id, date) DO UPDATE SET litres = EXCLUDED.litres
+       RETURNING *`,
+      [cow_id, date, parseFloat(litres)]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/records', verifyToken, requireAdmin, async (req, res) => {
   const { cow_name, date, litres, notes } = req.body;
   if (!cow_name || !date || !litres) return res.status(400).json({ error: 'cow_name, date and litres required' });
