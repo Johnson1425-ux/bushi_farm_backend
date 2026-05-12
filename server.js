@@ -1255,6 +1255,356 @@ app.get('/api/alerts/daily', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+function parseProcessingSheet(sheet) {
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    blankrows: false,
+  });
+ 
+  // ── helpers ──────────────────────────────────────────────
+  const cellText = (v) => (v == null ? '' : String(v).trim().toUpperCase());
+ 
+  // Find all column indices whose header is a day number (1–31)
+  function getDayColumns(headerRow) {
+    const cols = [];
+    headerRow.forEach((cell, idx) => {
+      const n = parseInt(cell);
+      if (!isNaN(n) && n >= 1 && n <= 31) cols.push({ day: n, idx });
+    });
+    return cols;
+  }
+ 
+  // Find the TOTAL column index
+  function getTotalColIdx(headerRow) {
+    for (let i = 0; i < headerRow.length; i++) {
+      if (cellText(headerRow[i]) === 'TOTAL') return i;
+    }
+    return -1;
+  }
+
+  // Detect section changes — only trigger on dedicated header rows where
+  // cols 0-2 are all null (real data rows always have product/size in col 1 or 2).
+  // This prevents summary total rows mid-section from flipping the section state.
+  function sectionOf(row) {
+    const text = row.map(cellText).join(' ');
+    // Order matters: check most specific first
+    if (text.includes('PROCESSING MILK STOCK') || text.includes('PROCESSED MILK STOCK')) return 'stock';
+    if (text.includes('ISSUED')) return 'issued';
+    if (text.includes('PROCESSED MILK LITRES') || text.includes('PROCESSING MILK LITRES')) return 'litres';
+    if (text.includes('PROCESSED MILK PACKED') || text.includes('PROCESSED MILK  PACKED')) return 'packed';
+    if (text.includes('MILK RESEIVED') || text.includes('MILK RECEIVED')) return 'received';
+    return null;
+  }
+ 
+  // Known products & their canonical names
+  const PRODUCTS = {
+    'VANILLA':     'Vanilla',
+    'STRAWBERRY':  'Strawberry',
+    'MTINDI BONGE':'Mtindi Bonge',
+    'MTINDI':      'Mtindi Bonge',
+  };
+  function detectProduct(row) {
+    for (const key of Object.keys(PRODUCTS)) {
+      if (row.map(cellText).some(t => t.includes(key))) return PRODUCTS[key];
+    }
+    return null;
+  }
+ 
+  // ── state machine ────────────────────────────────────────
+  let section = null;
+  let dayCols = [];
+  let totalColIdx = -1;
+  let currentProduct = null;
+  const received = {};   // { day: { farm, purchased } }
+  const packed   = [];   // [{ day, product, size, units }]
+  const litres   = [];   // [{ day, product, size, litres }]
+  const issued   = [];   // [{ day, product, size, units }]
+  const stock    = [];   // [{ product, size, units }]
+ 
+  // Detect label (month/year) from the sheet name or first rows
+  let label = 'Uploaded';
+ 
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.every(c => c == null)) continue;
+
+    // ── detect label from header rows ──
+    const joined = row.map(cellText).join(' ');
+    const monthMatch = joined.match(/(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+\d{4}/);
+    if (monthMatch && label === 'Uploaded') label = monthMatch[0].replace(/\s+/g, ' ');
+
+    // ── isSummaryTotalRow guard ──
+    // Rows that have numeric values at day column positions AND contain section keywords
+    // are summary/total rows — do NOT flip section for them
+    const isSummaryTotalRow = dayCols.length > 0 && dayCols.some(d => {
+      const v = row[d.idx];
+      return v != null && !isNaN(parseFloat(v)) && parseFloat(v) > 0;
+    });
+
+    // ── detect section change (only on non-summary rows) ──
+    if (!isSummaryTotalRow) {
+      const newSection = sectionOf(row);
+      if (newSection) { section = newSection; currentProduct = null; continue; }
+    }
+
+    // ── detect DATE header row (contains 1 2 3 ... 30) ──
+    const potentialDays = getDayColumns(row);
+    if (potentialDays.length >= 5) {
+      dayCols = potentialDays;
+      totalColIdx = getTotalColIdx(row);
+      continue;
+    }
+
+    if (!section || !dayCols.length) continue;
+
+    // ── detect product name ──
+    const prod = detectProduct(row);
+    if (prod) currentProduct = prod;
+
+    // ── detect size ──
+    let size = null;
+    for (let c = 0; c < Math.min(row.length, 5); c++) {
+      const t = cellText(row[c]);
+      if (!t) continue;
+      if (Object.keys(PRODUCTS).some(k => t.includes(k))) continue;
+      if (['FARM','PURCHASED','GRAND TOTAL','PROCESSED MILK LITRES',
+           'PROCESSED MILK PACKED','PROCESSING MILK LITRES','ISSUED'].some(x => t.includes(x))) continue;
+      if (/^\d+(\.\d+)?(ML|L)$/i.test(t) || t.includes('CHUPA') || t.includes('CUP') || t.includes('PACT') || /\d+ML/i.test(t)) {
+        size = t; break;
+      }
+    }
+ 
+    // ── RECEIVED section ──
+    if (section === 'received') {
+      const label2 = cellText(row[1]) || cellText(row[0]);
+      if (label2 === 'FARM' || label2.includes('FARM')) {
+        for (const d of dayCols) {
+          const v = parseFloat(row[d.idx]);
+          if (!isNaN(v) && v > 0) {
+            if (!received[d.day]) received[d.day] = { farm: 0, purchased: 0 };
+            received[d.day].farm = v;
+          }
+        }
+      }
+      if (label2 === 'PURCHASED' || label2.includes('PURCH')) {
+        for (const d of dayCols) {
+          const v = parseFloat(row[d.idx]);
+          if (!isNaN(v) && v > 0) {
+            if (!received[d.day]) received[d.day] = { farm: 0, purchased: 0 };
+            received[d.day].purchased = v;
+          }
+        }
+      }
+    }
+ 
+    // ── PACKED section ──
+    if (section === 'packed' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
+      for (const d of dayCols) {
+        const v = parseInt(row[d.idx]);
+        if (!isNaN(v) && v > 0) {
+          packed.push({ day: d.day, product: currentProduct, size, units: v });
+        }
+      }
+    }
+ 
+    // ── LITRES section ──
+    if (section === 'litres' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
+      for (const d of dayCols) {
+        const v = parseFloat(row[d.idx]);
+        if (!isNaN(v) && v > 0) {
+          litres.push({ day: d.day, product: currentProduct, size, litres: v });
+        }
+      }
+    }
+ 
+    // ── ISSUED section ──
+    if (section === 'issued' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
+      for (const d of dayCols) {
+        const v = parseInt(row[d.idx]);
+        if (!isNaN(v) && v > 0) {
+          issued.push({ day: d.day, product: currentProduct, size, units: v });
+        }
+      }
+    }
+ 
+    // ── STOCK section — summarise by product+size (totals, no daily) ──
+    if (section === 'stock' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
+      // Read from the TOTAL column (tracked from the day-header row)
+      const rawTotal = totalColIdx >= 0 ? row[totalColIdx] : null;
+      const total = parseFloat(rawTotal);
+      if (!isNaN(total) && total > 0) {
+        stock.push({ product: currentProduct, size, units: Math.round(total) });
+      }
+    }
+  }
+ 
+  return { label, received, packed, litres, issued, stock };
+}
+ 
+/* ══════════════════════════════════
+   GET  /api/processing               — list all uploads
+   GET  /api/processing/:id           — full data for one upload
+   POST /api/processing/upload        — parse & save a new xlsx (admin)
+   DELETE /api/processing/:id         — delete an upload (admin)
+══════════════════════════════════ */
+ 
+/* List all uploads */
+app.get('/api/processing', verifyToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.label, u.uploaded_at, usr.username AS uploaded_by
+      FROM processing_uploads u
+      LEFT JOIN users usr ON usr.id = u.uploaded_by
+      ORDER BY u.uploaded_at DESC
+    `);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+ 
+/* Full data for one upload — returns summary + daily arrays */
+app.get('/api/processing/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const uploadRes = await pool.query(
+      `SELECT u.id, u.label, u.uploaded_at, usr.username AS uploaded_by
+       FROM processing_uploads u LEFT JOIN users usr ON usr.id = u.uploaded_by
+       WHERE u.id=$1`,
+      [id]
+    );
+    if (!uploadRes.rows.length) return res.status(404).json({ error: 'Not found' });
+ 
+    const [received, packed, issued, stock] = await Promise.all([
+      pool.query(
+        `SELECT day, farm_litres, purchased_litres FROM processing_milk_received
+         WHERE upload_id=$1 ORDER BY day`, [id]
+      ),
+      pool.query(
+        `SELECT day, product, size, units, litres FROM processing_packed
+         WHERE upload_id=$1 ORDER BY product, size, day`, [id]
+      ),
+      pool.query(
+        `SELECT day, product, size, units, litres FROM processing_issued
+         WHERE upload_id=$1 ORDER BY product, size, day`, [id]
+      ),
+      pool.query(
+        `SELECT product, size, units FROM processing_stock
+         WHERE upload_id=$1 ORDER BY product, size`, [id]
+      ),
+    ]);
+ 
+    res.json({
+      upload:   uploadRes.rows[0],
+      received: received.rows,
+      packed:   packed.rows,
+      issued:   issued.rows,
+      stock:    stock.rows,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+ 
+/* Upload & parse a new xlsx file */
+app.post('/api/processing/upload', verifyToken, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+ 
+  let parsed;
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    // Try to find the monthly sheet (not SUMMARY, not empty "sheet")
+    const sheetName =
+      wb.SheetNames.find(n => /^\w+ \d{4}$/i.test(n.trim())) ||
+      wb.SheetNames.find(n => !n.toUpperCase().includes('SUMMARY') && n.toLowerCase() !== 'sheet') ||
+      wb.SheetNames[0];
+    parsed = parseProcessingSheet(wb.Sheets[sheetName]);
+  } catch (err) {
+    return res.status(400).json({ error: 'Failed to parse file: ' + err.message });
+  }
+ 
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+ 
+    // 1. Create upload record
+    const upRes = await client.query(
+      `INSERT INTO processing_uploads(label, uploaded_by) VALUES($1,$2) RETURNING id`,
+      [parsed.label, req.user.id]
+    );
+    const uploadId = upRes.rows[0].id;
+ 
+    // 2. Milk received
+    for (const [day, vals] of Object.entries(parsed.received)) {
+      await client.query(
+        `INSERT INTO processing_milk_received(upload_id, day, farm_litres, purchased_litres)
+         VALUES($1,$2,$3,$4)`,
+        [uploadId, parseInt(day), vals.farm || 0, vals.purchased || 0]
+      );
+    }
+ 
+    // 3. Packed units + litres (merge by day+product+size)
+    const packedMap = {};
+    for (const r of parsed.packed) {
+      const key = `${r.day}|${r.product}|${r.size}`;
+      packedMap[key] = { ...r, litres: 0 };
+    }
+    for (const r of parsed.litres) {
+      const key = `${r.day}|${r.product}|${r.size}`;
+      if (packedMap[key]) packedMap[key].litres = r.litres;
+      else packedMap[key] = { day: r.day, product: r.product, size: r.size, units: 0, litres: r.litres };
+    }
+    for (const r of Object.values(packedMap)) {
+      await client.query(
+        `INSERT INTO processing_packed(upload_id, day, product, size, units, litres)
+         VALUES($1,$2,$3,$4,$5,$6)`,
+        [uploadId, r.day, r.product, r.size, r.units || 0, r.litres || 0]
+      );
+    }
+ 
+    // 4. Issued
+    for (const r of parsed.issued) {
+      await client.query(
+        `INSERT INTO processing_issued(upload_id, day, product, size, units, litres)
+         VALUES($1,$2,$3,$4,$5,$6)`,
+        [uploadId, r.day, r.product, r.size, r.units || 0, 0]
+      );
+    }
+ 
+    // 5. Stock
+    for (const r of parsed.stock) {
+      await client.query(
+        `INSERT INTO processing_stock(upload_id, product, size, units)
+         VALUES($1,$2,$3,$4)`,
+        [uploadId, r.product, r.size, r.units || 0]
+      );
+    }
+ 
+    await client.query('COMMIT');
+    res.status(201).json({
+      success: true,
+      upload_id: uploadId,
+      label: parsed.label,
+      summary: {
+        received_days: Object.keys(parsed.received).length,
+        packed_rows:   parsed.packed.length,
+        issued_rows:   parsed.issued.length,
+        stock_rows:    parsed.stock.length,
+      },
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+ 
+/* Delete an upload */
+app.delete('/api/processing/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM processing_uploads WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 /* ══════════════════════════════════
    START (Updated for Vercel)
 ══════════════════════════════════ */
