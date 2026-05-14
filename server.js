@@ -6,6 +6,7 @@ const XLSX     = require('xlsx');
 const bcrypt   = require('bcrypt');
 const jwt      = require('jsonwebtoken');
 const path     = require('path');
+const mammoth   = require('mammoth');
 const { pool, initDB }           = require('./db');
 const { verifyToken, requireAdmin, SECRET } = require('./auth');
 
@@ -1614,6 +1615,298 @@ app.post('/api/processing/upload', verifyToken, upload.single('file'), async (re
 app.delete('/api/processing/:id', verifyToken, requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM processing_uploads WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* ── DB migration — run once ──────────────────────────────── */
+async function initHealthRecordsTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cow_health_records (
+      id                    SERIAL PRIMARY KEY,
+      cow_id                INT REFERENCES cows(id) ON DELETE CASCADE,
+      cow_tag               TEXT,
+      age                   TEXT,
+      breed                 TEXT,
+      parity                TEXT,
+      daily_milk_yield      TEXT,
+      days_in_milk          TEXT,
+      body_weight           TEXT,
+      body_temperature      TEXT,
+      pulse_rate            TEXT,
+      respiratory_rate      TEXT,
+      crt_seconds           TEXT,
+      rumino_motility       TEXT,
+      present_illness       TEXT,
+      past_history          TEXT,
+      environment           TEXT,
+      system_review         TEXT,
+      -- Clinical exam findings stored as JSON: [{system, status, observations}]
+      clinical_findings     JSONB DEFAULT '[]',
+      tentative_diagnosis   TEXT,
+      -- Lab results
+      blood_smear           TEXT,
+      buffy_coat            TEXT,
+      pcv                   TEXT,
+      eosinophils           TEXT,
+      basophils             TEXT,
+      neutrophils           TEXT,
+      bacteriology          TEXT,
+      skin_scrapings        TEXT,
+      fecal_sample          TEXT,
+      other_lab             TEXT,
+      lab_findings          TEXT,
+      final_diagnosis       TEXT,
+      -- Treatments stored as JSON: [{drug, prescription}]
+      treatments            JSONB DEFAULT '[]',
+      milk_withdraw_date    TEXT,
+      attending_vet         TEXT,
+      license_number        TEXT,
+      exam_date             TEXT,
+      -- meta
+      source_filename       TEXT,
+      uploaded_at           TIMESTAMPTZ DEFAULT NOW(),
+      created_at            TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+}
+initHealthRecordsTables().catch(err =>
+  console.error('initHealthRecordsTables error:', err.message)
+);
+ 
+/* ── Parser: extract raw text → structured fields ─────────── */
+function parseHealthDoc(rawText) {
+  const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+ 
+  function after(label) {
+    // Find a line containing `label`, return everything after it (trimmed)
+    for (const line of lines) {
+      const idx = line.toUpperCase().indexOf(label.toUpperCase());
+      if (idx !== -1) {
+        const rest = line.slice(idx + label.length).replace(/^[\s:_\-]+/, '').trim();
+        if (rest) return rest;
+      }
+    }
+    return null;
+  }
+ 
+  function afterMulti(labels) {
+    for (const l of labels) { const v = after(l); if (v) return v; }
+    return null;
+  }
+ 
+  // Extract table-based fields (look for patterns in raw text)
+  function tableField(rowLabel) {
+    // Pattern: "Label   Value" or "Label: Value"
+    const re = new RegExp(rowLabel + '[\\s:_]+(\\S[^\\n]*)', 'i');
+    const m = rawText.match(re);
+    return m ? m[1].trim() : null;
+  }
+ 
+  // Clinical exam systems
+  const SYSTEMS = [
+    'General Appearance', 'Integumentary', 'Musculoskeletal',
+    'Circulatory', 'Respiratory', 'Digestive', 'Genitourinary',
+    'Ears/Eyes', 'Mammary system', 'Neural system', 'Lymph nodes',
+  ];
+  const clinicalFindings = SYSTEMS.map(system => {
+    const pattern = new RegExp(system + '[\\s\\S]{0,60}?(Normal|Abnormal)', 'i');
+    const m = rawText.match(pattern);
+    return {
+      system,
+      status: m ? m[1] : null,
+      observations: null,
+    };
+  }).filter(f => f.status);
+ 
+  // Treatments table rows: look for "Drug/vaccine" sections
+  const treatments = [];
+  const treatmentSection = rawText.match(/Drug\/vaccine[\s\S]*?(?=Milk withdraw|$)/i);
+  if (treatmentSection) {
+    const rows = treatmentSection[0].split('\n').slice(1);
+    for (const row of rows) {
+      const parts = row.split(/\t|  {2,}/).map(p => p.trim()).filter(Boolean);
+      if (parts.length >= 2 && parts[0] && parts[0].length > 1) {
+        treatments.push({ drug: parts[0], prescription: parts.slice(1).join(' ') });
+      }
+    }
+  }
+ 
+  return {
+    cow_tag:             tableField('Cow ID/Tag') || tableField('Cow ID'),
+    body_weight:         tableField('Body weight'),
+    age:                 tableField('Age'),
+    breed:               tableField('Breed'),
+    parity:              tableField('Parity'),
+    daily_milk_yield:    tableField('Daily milk yield'),
+    days_in_milk:        tableField('Days in milk'),
+    body_temperature:    tableField('Body temperature'),
+    pulse_rate:          tableField('Pulse rate'),
+    respiratory_rate:    tableField('Respiratory rate'),
+    crt_seconds:         tableField('CRT'),
+    rumino_motility:     tableField('Rumino-motility') || tableField('Ruminomotility'),
+    present_illness:     afterMulti(['Present illness', 'Present Illness']),
+    past_history:        afterMulti(['Past history', 'Past History']),
+    environment:         after('Environment'),
+    system_review:       afterMulti(['System review', 'System Review']),
+    clinical_findings:   clinicalFindings,
+    tentative_diagnosis: afterMulti(['Tentative diagnosis', 'Tentative/Final diagnosis', 'TENTATIVE DIAGNOSIS']),
+    final_diagnosis:     afterMulti(['Final diagnosis', 'FINAL DIAGNOSIS', 'Tentative/Final diagnosis']),
+    blood_smear:         tableField('Blood smear'),
+    buffy_coat:          tableField('Buffy coat'),
+    pcv:                 tableField('PCV'),
+    eosinophils:         tableField('Eosinophils'),
+    basophils:           tableField('Basophils'),
+    neutrophils:         tableField('Neutrophils'),
+    bacteriology:        afterMulti(['Bacteriology culture', 'Bacteriology']),
+    skin_scrapings:      afterMulti(['Skin scrapings', 'Skin scraping']),
+    fecal_sample:        afterMulti(['Fecal sample', 'Faecal sample']),
+    other_lab:           afterMulti(['Other laboratory', 'Other lab']),
+    lab_findings:        after('Findings'),
+    treatments:          treatments,
+    milk_withdraw_date:  afterMulti(['Milk withdraw end date', 'Milk withdraw']),
+    attending_vet:       afterMulti(['Attending veterinarian', 'Attending vet']),
+    license_number:      afterMulti(['License #', 'License']),
+    exam_date:           after('Date'),
+  };
+}
+ 
+/* ── GET  /api/health-records  — list all (optionally by cow) */
+app.get('/api/health-records', verifyToken, async (req, res) => {
+  const { cow_id } = req.query;
+  const params = [];
+  const where = cow_id ? (params.push(cow_id), 'WHERE hr.cow_id = $1') : '';
+  try {
+    const { rows } = await pool.query(`
+      SELECT hr.id, hr.cow_id, c.name AS cow_name, hr.cow_tag,
+             hr.breed, hr.age, hr.exam_date,
+             hr.tentative_diagnosis, hr.final_diagnosis,
+             hr.attending_vet, hr.source_filename, hr.uploaded_at,
+             JSONB_ARRAY_LENGTH(hr.treatments) AS treatment_count
+      FROM cow_health_records hr
+      LEFT JOIN cows c ON c.id = hr.cow_id
+      ${where}
+      ORDER BY hr.uploaded_at DESC
+    `, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+ 
+/* ── GET  /api/health-records/:id  — full record */
+app.get('/api/health-records/:id', verifyToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT hr.*, c.name AS cow_name
+       FROM cow_health_records hr
+       LEFT JOIN cows c ON c.id = hr.cow_id
+       WHERE hr.id = $1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+ 
+/* ── POST /api/health-records/import  — upload .docx */
+app.post('/api/health-records/import', verifyToken, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const ext = req.file.originalname.split('.').pop().toLowerCase();
+  if (!['docx', 'doc'].includes(ext))
+    return res.status(400).json({ error: 'Only .docx / .doc files are supported' });
+ 
+  try {
+    // 1. Extract text from docx
+    const result = await mammoth.extractRawText({ buffer: req.file.buffer });
+    const rawText = result.value;
+ 
+    // 2. Parse fields from text
+    const parsed = parseHealthDoc(rawText);
+ 
+    // 3. Resolve cow_id — match by tag or name if provided in body or parsed
+    let cow_id = req.body.cow_id ? parseInt(req.body.cow_id) : null;
+    if (!cow_id && parsed.cow_tag) {
+      const match = await pool.query(
+        `SELECT id FROM cows WHERE tag = $1 OR UPPER(name) = UPPER($1) LIMIT 1`,
+        [parsed.cow_tag]
+      );
+      if (match.rows.length) cow_id = match.rows[0].id;
+    }
+ 
+    // 4. Save to DB
+    const { rows } = await pool.query(`
+      INSERT INTO cow_health_records (
+        cow_id, cow_tag, age, breed, parity, daily_milk_yield, days_in_milk,
+        body_weight, body_temperature, pulse_rate, respiratory_rate,
+        crt_seconds, rumino_motility, present_illness, past_history,
+        environment, system_review, clinical_findings, tentative_diagnosis,
+        blood_smear, buffy_coat, pcv, eosinophils, basophils, neutrophils,
+        bacteriology, skin_scrapings, fecal_sample, other_lab, lab_findings,
+        final_diagnosis, treatments, milk_withdraw_date, attending_vet,
+        license_number, exam_date, source_filename
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+        $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,
+        $33,$34,$35,$36,$37
+      ) RETURNING id, cow_id, cow_tag, exam_date, final_diagnosis, uploaded_at
+    `, [
+      cow_id,
+      parsed.cow_tag,
+      parsed.age,
+      parsed.breed,
+      parsed.parity,
+      parsed.daily_milk_yield,
+      parsed.days_in_milk,
+      parsed.body_weight,
+      parsed.body_temperature,
+      parsed.pulse_rate,
+      parsed.respiratory_rate,
+      parsed.crt_seconds,
+      parsed.rumino_motility,
+      parsed.present_illness,
+      parsed.past_history,
+      parsed.environment,
+      parsed.system_review,
+      JSON.stringify(parsed.clinical_findings),
+      parsed.tentative_diagnosis,
+      parsed.blood_smear,
+      parsed.buffy_coat,
+      parsed.pcv,
+      parsed.eosinophils,
+      parsed.basophils,
+      parsed.neutrophils,
+      parsed.bacteriology,
+      parsed.skin_scrapings,
+      parsed.fecal_sample,
+      parsed.other_lab,
+      parsed.lab_findings,
+      parsed.final_diagnosis,
+      JSON.stringify(parsed.treatments),
+      parsed.milk_withdraw_date,
+      parsed.attending_vet,
+      parsed.license_number,
+      parsed.exam_date,
+      req.file.originalname,
+    ]);
+ 
+    res.status(201).json({
+      success: true,
+      record: rows[0],
+      parsed_fields: Object.fromEntries(
+        Object.entries(parsed).filter(([, v]) =>
+          v !== null && (Array.isArray(v) ? v.length > 0 : true)
+        )
+      ),
+      warnings: result.messages,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+ 
+/* ── DELETE /api/health-records/:id */
+app.delete('/api/health-records/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM cow_health_records WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
