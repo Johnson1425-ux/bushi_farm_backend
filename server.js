@@ -1676,98 +1676,140 @@ initHealthRecordsTables().catch(err =>
  
 /* ── Parser: extract raw text → structured fields ─────────── */
 function parseHealthDoc(rawText) {
-  const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
- 
-  function after(label) {
-    // Find a line containing `label`, return everything after it (trimmed)
-    for (const line of lines) {
-      const idx = line.toUpperCase().indexOf(label.toUpperCase());
-      if (idx !== -1) {
-        const rest = line.slice(idx + label.length).replace(/^[\s:_\-]+/, '').trim();
-        if (rest) return rest;
+  // mammoth extracts table cells as separate lines — filled form looks like:
+  // "Cow ID/Tag\n\nBOSS001\n\nBody weight\n\n320kg"
+  // So we build a label->nextValue map from the line sequence
+  const lines = rawText.split('\n').map(l => l.trim());
+  const nonEmpty = lines.filter(Boolean);
+
+  // Build label->value map: for each non-empty line that looks like a label,
+  // the VALUE is the next non-empty line that isn't another label
+  const LABELS = new Set([
+    'COW ID/TAG','BODY WEIGHT','AGE','BREED','PARITY','DAILY MILK YIELD',
+    'DAYS IN MILK','BODY TEMPERATURE','PULSE RATE(BEATS/MINS)','PULSE RATE',
+    'RESPIRATORY RATE(BEATS/MIN)','RESPIRATORY RATE','CRT(SECONDS)','CRT',
+    'RUMINO-MOTILITY','RUMINOMOTILITY','BLOOD SMEAR','BUFFY COAT SMEAR',
+    'BUFFY COAT','PCV','EOSINOPHILS','BASOPHILS','NEUTROPHILS',
+    'SYSTEM','STATUS(NORMAL/ABNORMAL)','SPECIFIC OBSERVATIONS',
+    'DRUG/VACCINE','PRESCRIPTION(DOSE, DOSAGE AND ROUTE)',
+  ]);
+
+  // nextValue(label) — finds label in nonEmpty array, returns next non-label, non-empty line
+  function nextValue(labelVariants) {
+    for (const label of labelVariants) {
+      for (let i = 0; i < nonEmpty.length; i++) {
+        const t = nonEmpty[i].toUpperCase().replace(/[_\-\/\(\)]+/g, ' ').trim();
+        const lbl = label.toUpperCase().replace(/[_\-\/\(\)]+/g, ' ').trim();
+        if (t.startsWith(lbl)) {
+          // Value might be on same line after the label
+          const sameLine = nonEmpty[i].slice(label.length).replace(/^[\s:_]+/, '').trim();
+          if (sameLine && !LABELS.has(sameLine.toUpperCase())) return sameLine;
+          // Or next non-empty, non-label line
+          for (let j = i + 1; j < nonEmpty.length; j++) {
+            const next = nonEmpty[j].trim();
+            if (!next) continue;
+            // Skip if it looks like a section header or another label
+            if (LABELS.has(next.toUpperCase())) break;
+            if (/^[A-Z ]{8,}$/.test(next) && !next.match(/\d/)) break; // ALL CAPS header
+            if (next.startsWith('_')) continue; // blank line pattern ___
+            return next;
+          }
+        }
       }
     }
     return null;
   }
- 
-  function afterMulti(labels) {
-    for (const l of labels) { const v = after(l); if (v) return v; }
+
+  // afterLine — finds text after a pattern on the SAME line (for ___ fields)
+  function afterLine(labelVariants) {
+    for (const label of labelVariants) {
+      for (const line of nonEmpty) {
+        const idx = line.toUpperCase().indexOf(label.toUpperCase());
+        if (idx !== -1) {
+          const rest = line.slice(idx + label.length).replace(/^[\s:_]+/, '').trim();
+          if (rest && !rest.match(/^_+$/) && rest.length > 1) return rest;
+        }
+      }
+    }
     return null;
   }
- 
-  // Extract table-based fields (look for patterns in raw text)
-  function tableField(rowLabel) {
-    // Pattern: "Label   Value" or "Label: Value"
-    const re = new RegExp(rowLabel + '[\\s:_]+(\\S[^\\n]*)', 'i');
-    const m = rawText.match(re);
-    return m ? m[1].trim() : null;
-  }
- 
-  // Clinical exam systems
+
+  // Clinical systems — look for "SystemName\nNormal/Abnormal\nObservations" pattern
   const SYSTEMS = [
-    'General Appearance', 'Integumentary', 'Musculoskeletal',
-    'Circulatory', 'Respiratory', 'Digestive', 'Genitourinary',
-    'Ears/Eyes', 'Mammary system', 'Neural system', 'Lymph nodes',
+    'General Appearance','Integumentary','Musculoskeletal','Circulatory',
+    'Respiratory','Digestive','Genitourinary','Ears/Eyes',
+    'Mammary system','Neural system','Lymph nodes','Circulatory(MM/CRT)',
   ];
-  const clinicalFindings = SYSTEMS.map(system => {
-    const pattern = new RegExp(system + '[\\s\\S]{0,60}?(Normal|Abnormal)', 'i');
-    const m = rawText.match(pattern);
-    return {
-      system,
-      status: m ? m[1] : null,
-      observations: null,
-    };
-  }).filter(f => f.status);
- 
-  // Treatments table rows: look for "Drug/vaccine" sections
-  const treatments = [];
-  const treatmentSection = rawText.match(/Drug\/vaccine[\s\S]*?(?=Milk withdraw|$)/i);
-  if (treatmentSection) {
-    const rows = treatmentSection[0].split('\n').slice(1);
-    for (const row of rows) {
-      const parts = row.split(/\t|  {2,}/).map(p => p.trim()).filter(Boolean);
-      if (parts.length >= 2 && parts[0] && parts[0].length > 1) {
-        treatments.push({ drug: parts[0], prescription: parts.slice(1).join(' ') });
+  const clinicalFindings = [];
+  for (const system of SYSTEMS) {
+    for (let i = 0; i < nonEmpty.length; i++) {
+      if (nonEmpty[i].toUpperCase().startsWith(system.toUpperCase())) {
+        const status = nonEmpty[i+1]?.match(/^(Normal|Abnormal)$/i)?.[0] || null;
+        const observations = status && nonEmpty[i+2] && !SYSTEMS.some(s => nonEmpty[i+2].toUpperCase().startsWith(s.toUpperCase()))
+          ? nonEmpty[i+2] : null;
+        if (status) clinicalFindings.push({ system, status, observations });
+        break;
       }
     }
   }
- 
+
+  // Treatments: "Drug/vaccine" section — pairs of drug + prescription lines
+  const treatments = [];
+  let inTreatments = false;
+  for (let i = 0; i < nonEmpty.length; i++) {
+    if (nonEmpty[i].toUpperCase().includes('DRUG/VACCINE')) { inTreatments = true; continue; }
+    if (inTreatments) {
+      if (nonEmpty[i].toUpperCase().includes('MILK WITHDRAW')) break;
+      if (nonEmpty[i].toUpperCase().includes('PRESCRIPTION')) continue;
+      const drug = nonEmpty[i].trim();
+      const prescription = nonEmpty[i+1]?.trim() || '';
+      if (drug && !drug.match(/^_+$/) && drug.length > 1 &&
+          !['DIAGNOSIS','TREATMENT','COMPLIANCE'].some(k => drug.toUpperCase().includes(k))) {
+        treatments.push({ drug, prescription: prescription.match(/^_+$/) ? '' : prescription });
+        i++; // skip prescription line
+      }
+    }
+  }
+
   return {
-    cow_tag:             tableField('Cow ID/Tag') || tableField('Cow ID'),
-    body_weight:         tableField('Body weight'),
-    age:                 tableField('Age'),
-    breed:               tableField('Breed'),
-    parity:              tableField('Parity'),
-    daily_milk_yield:    tableField('Daily milk yield'),
-    days_in_milk:        tableField('Days in milk'),
-    body_temperature:    tableField('Body temperature'),
-    pulse_rate:          tableField('Pulse rate'),
-    respiratory_rate:    tableField('Respiratory rate'),
-    crt_seconds:         tableField('CRT'),
-    rumino_motility:     tableField('Rumino-motility') || tableField('Ruminomotility'),
-    present_illness:     afterMulti(['Present illness', 'Present Illness']),
-    past_history:        afterMulti(['Past history', 'Past History']),
-    environment:         after('Environment'),
-    system_review:       afterMulti(['System review', 'System Review']),
+    cow_tag:             nextValue(['Cow ID/Tag','Cow ID']),
+    body_weight:         nextValue(['Body weight']),
+    age:                 nextValue(['Age']),
+    breed:               nextValue(['Breed']),
+    parity:              nextValue(['Parity']),
+    daily_milk_yield:    nextValue(['Daily milk yield']),
+    days_in_milk:        nextValue(['Days in milk']),
+    body_temperature:    nextValue(['Body temperature']),
+    pulse_rate:          nextValue(['Pulse rate(beats/mins)','Pulse rate']),
+    respiratory_rate:    nextValue(['Respiratory rate(beats/min)','Respiratory rate']),
+    crt_seconds:         nextValue(['CRT(seconds)','CRT']),
+    rumino_motility:     nextValue(['Rumino-motility','Ruminomotility']),
+    present_illness:     afterLine(['Present illness']),
+    past_history:        afterLine(['Past history']),
+    environment:         afterLine(['Environment']),
+    system_review:       afterLine(['System review']),
     clinical_findings:   clinicalFindings,
-    tentative_diagnosis: afterMulti(['Tentative diagnosis', 'Tentative/Final diagnosis', 'TENTATIVE DIAGNOSIS']),
-    final_diagnosis:     afterMulti(['Final diagnosis', 'FINAL DIAGNOSIS', 'Tentative/Final diagnosis']),
-    blood_smear:         tableField('Blood smear'),
-    buffy_coat:          tableField('Buffy coat'),
-    pcv:                 tableField('PCV'),
-    eosinophils:         tableField('Eosinophils'),
-    basophils:           tableField('Basophils'),
-    neutrophils:         tableField('Neutrophils'),
-    bacteriology:        afterMulti(['Bacteriology culture', 'Bacteriology']),
-    skin_scrapings:      afterMulti(['Skin scrapings', 'Skin scraping']),
-    fecal_sample:        afterMulti(['Fecal sample', 'Faecal sample']),
-    other_lab:           afterMulti(['Other laboratory', 'Other lab']),
-    lab_findings:        after('Findings'),
-    treatments:          treatments,
-    milk_withdraw_date:  afterMulti(['Milk withdraw end date', 'Milk withdraw']),
-    attending_vet:       afterMulti(['Attending veterinarian', 'Attending vet']),
-    license_number:      afterMulti(['License #', 'License']),
-    exam_date:           after('Date'),
+    tentative_diagnosis: afterLine(['TENTATIVE DIAGNOSIS']) ||
+                         afterLine(['Tentative/Final diagnosis']) ||
+                         afterLine(['Tentative diagnosis']),
+    final_diagnosis:     afterLine(['Tentative/Final diagnosis']) ||
+                         afterLine(['Final diagnosis']),
+    blood_smear:         nextValue(['Blood smear']),
+    buffy_coat:          nextValue(['Buffy coat smear','Buffy coat']),
+    pcv:                 nextValue(['PCV']),
+    eosinophils:         nextValue(['Eosinophils']),
+    basophils:           nextValue(['Basophils']),
+    neutrophils:         nextValue(['Neutrophils']),
+    bacteriology:        afterLine(['Bacteriology culture & sensitivity results','Bacteriology']),
+    skin_scrapings:      afterLine(['Skin scrapings']),
+    fecal_sample:        afterLine(['Fecal sample']),
+    other_lab:           afterLine(['Other laboratory']),
+    lab_findings:        afterLine(['Findings']),
+    treatments,
+    milk_withdraw_date:  afterLine(['Milk withdraw end date','Milk withdraw']),
+    attending_vet:       afterLine(['Attending veterinarian/ paraveterinarian','Attending veterinarian']),
+    license_number:      afterLine(['License #']),
+    exam_date:           afterLine(['Date']),
   };
 }
  
