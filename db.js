@@ -35,7 +35,7 @@ async function initDB() {
         id            SERIAL PRIMARY KEY,
         username      VARCHAR(50) NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
-        role          VARCHAR(10) NOT NULL DEFAULT 'viewer' CHECK (role IN ('admin', 'viewer')),
+        role          VARCHAR(10) NOT NULL DEFAULT 'viewer' CHECK (role IN ('admin', 'viewer', 'manager', 'veteran')),
         created_at    TIMESTAMP DEFAULT NOW()
       );
 
@@ -72,6 +72,64 @@ async function initDB() {
         created_at      TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(date);
+
+      CREATE TABLE IF NOT EXISTS processing_uploads (
+        id          SERIAL PRIMARY KEY,
+        label       TEXT NOT NULL,
+        uploaded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        uploaded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS processing_milk_received (
+        id               SERIAL PRIMARY KEY,
+        upload_id        INTEGER NOT NULL REFERENCES processing_uploads(id) ON DELETE CASCADE,
+        day              INTEGER NOT NULL CHECK (day BETWEEN 1 AND 31),
+        farm_litres      NUMERIC NOT NULL DEFAULT 0,
+        purchased_litres NUMERIC NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_proc_received_upload ON processing_milk_received(upload_id);
+
+      CREATE TABLE IF NOT EXISTS processing_packed (
+        id        SERIAL PRIMARY KEY,
+        upload_id INTEGER NOT NULL REFERENCES processing_uploads(id) ON DELETE CASCADE,
+        day       INTEGER NOT NULL CHECK (day BETWEEN 1 AND 31),
+        product   TEXT NOT NULL,
+        size      TEXT NOT NULL,
+        units     NUMERIC NOT NULL DEFAULT 0,
+        litres    NUMERIC NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_proc_packed_upload ON processing_packed(upload_id);
+
+      CREATE TABLE IF NOT EXISTS processing_issued (
+        id        SERIAL PRIMARY KEY,
+        upload_id INTEGER NOT NULL REFERENCES processing_uploads(id) ON DELETE CASCADE,
+        day       INTEGER NOT NULL CHECK (day BETWEEN 1 AND 31),
+        product   TEXT NOT NULL,
+        size      TEXT NOT NULL,
+        units     NUMERIC NOT NULL DEFAULT 0,
+        litres    NUMERIC NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_proc_issued_upload ON processing_issued(upload_id);
+
+      CREATE TABLE IF NOT EXISTS processing_damaged (
+        id        SERIAL PRIMARY KEY,
+        upload_id INTEGER NOT NULL REFERENCES processing_uploads(id) ON DELETE CASCADE,
+        day       INTEGER NOT NULL CHECK (day BETWEEN 1 AND 31),
+        product   TEXT NOT NULL,
+        size      TEXT NOT NULL,
+        units     NUMERIC NOT NULL DEFAULT 0,
+        litres    NUMERIC NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_proc_damaged_upload ON processing_damaged(upload_id);
+
+      CREATE TABLE IF NOT EXISTS processing_stock (
+        id        SERIAL PRIMARY KEY,
+        upload_id INTEGER NOT NULL REFERENCES processing_uploads(id) ON DELETE CASCADE,
+        product   TEXT NOT NULL,
+        size      TEXT NOT NULL,
+        units     NUMERIC NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_proc_stock_upload ON processing_stock(upload_id);
     `);
 
     /* Seed a default admin if no users exist yet */

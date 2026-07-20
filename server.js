@@ -63,9 +63,9 @@ app.get('/api/users', verifyToken, requireAdmin, async (req, res) => {
 });
 
 app.post('/api/users', verifyToken, requireAdmin, async (req, res) => {
-  const { username, password, role = 'viewer' } = req.body;
+  const { username, password, role = ['viewer', 'veteran', 'manager'] } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (!['admin', 'viewer'].includes(role)) return res.status(400).json({ error: 'role must be admin or viewer' });
+  if (!['admin', 'viewer', 'manager', 'veteran'].includes(role)) return res.status(400).json({ error: 'Role not found' });
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
@@ -401,22 +401,22 @@ app.get('/api/analytics/dates', verifyToken, async (req, res) => {
 /* ══════════════════════════════════
    PUBLIC STATS  (no auth required)
 ══════════════════════════════════ */
-app.get('/api/public/stats', async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        COALESCE(COUNT(DISTINCT c.id)::int, 0)       AS total_cows,
-        COALESCE(COUNT(r.id)::int, 0)                AS total_records,
-        COALESCE(ROUND(SUM(r.litres)::numeric, 1), 0) AS total_litres,
-        COALESCE(ROUND(AVG(r.litres)::numeric, 2), 0) AS overall_avg,
-        COALESCE(COUNT(DISTINCT r.date)::int, 0)     AS days_tracked
-      FROM cows c LEFT JOIN milk_records r ON r.cow_id = c.id
-    `);
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// app.get('/api/public/stats', async (req, res) => {
+//   try {
+//     const { rows } = await pool.query(`
+//       SELECT
+//         COALESCE(COUNT(DISTINCT c.id)::int, 0)       AS total_cows,
+//         COALESCE(COUNT(r.id)::int, 0)                AS total_records,
+//         COALESCE(ROUND(SUM(r.litres)::numeric, 1), 0) AS total_litres,
+//         COALESCE(ROUND(AVG(r.litres)::numeric, 2), 0) AS overall_avg,
+//         COALESCE(COUNT(DISTINCT r.date)::int, 0)     AS days_tracked
+//       FROM cows c LEFT JOIN milk_records r ON r.cow_id = c.id
+//     `);
+//     res.json(rows[0]);
+//   } catch (err) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
 /* ══════════════════════════════════
    DISEASES & TREATMENTS
@@ -1269,130 +1269,152 @@ app.get('/api/alerts/daily', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-function parseProcessingSheet(sheet) {
-  const rows = XLSX.utils.sheet_to_json(sheet, {
-    header: 1,
-    defval: null,
-    blankrows: false,
-  });
- 
-  // ── helpers ──────────────────────────────────────────────
-  const cellText = (v) => (v == null ? '' : String(v).trim().toUpperCase());
- 
-  // Find all column indices whose header is a day number (1–31)
-  function getDayColumns(headerRow) {
-    const cols = [];
-    headerRow.forEach((cell, idx) => {
-      const n = parseInt(cell);
-      if (!isNaN(n) && n >= 1 && n <= 31) cols.push({ day: n, idx });
-    });
-    return cols;
-  }
- 
-  // Find the TOTAL column index
-  function getTotalColIdx(headerRow) {
-    for (let i = 0; i < headerRow.length; i++) {
-      if (cellText(headerRow[i]) === 'TOTAL') return i;
-    }
-    return -1;
-  }
+// ── shared helpers ───────────────────────────────────────────────────
+const cellText = (v) => (v == null ? '' : String(v).trim().toUpperCase());
 
-  // Detect section changes — only trigger on dedicated header rows where
-  // cols 0-2 are all null (real data rows always have product/size in col 1 or 2).
-  // This prevents summary total rows mid-section from flipping the section state.
-  function sectionOf(row) {
-    const text = row.map(cellText).join(' ');
-    // Order matters: check most specific first
-    if (text.includes('PROCESSING MILK STOCK') || text.includes('PROCESSED MILK STOCK')) return 'stock';
-    if (text.includes('ISSUED')) return 'issued';
-    if (text.includes('PROCESSED MILK LITRES') || text.includes('PROCESSING MILK LITRES')) return 'litres';
-    if (text.includes('PROCESSED MILK PACKED') || text.includes('PROCESSED MILK  PACKED')) return 'packed';
-    if (text.includes('MILK RESEIVED') || text.includes('MILK RECEIVED')) return 'received';
-    return null;
+// A real date-header row lists days 1, 2, 3 … strictly in order starting
+// at 1. Ordinary data rows can contain 5+ values in the 1–31 range by
+// coincidence (units, litres) and must NOT be treated as a new header.
+function getDayColumns(headerRow) {
+  const cols = [];
+  headerRow.forEach((cell, idx) => {
+    const n = parseInt(cell);
+    if (!isNaN(n) && n >= 1 && n <= 31) cols.push({ day: n, idx });
+  });
+  return cols;
+}
+function isDateHeaderRow(headerRow) {
+  const cols = getDayColumns(headerRow);
+  if (cols.length < 5) return false;
+  if (cols[0].day !== 1) return false;
+  for (let i = 1; i < cols.length; i++) {
+    if (cols[i].day !== cols[i - 1].day + 1) return false;
   }
- 
-  // Known products & their canonical names
-  const PRODUCTS = {
-    'VANILLA':     'Vanilla',
-    'STRAWBERRY':  'Strawberry',
-    'MTINDI BONGE':'Mtindi Bonge',
-    'MTINDI':      'Mtindi Bonge',
-  };
-  function detectProduct(row) {
-    for (const key of Object.keys(PRODUCTS)) {
-      if (row.map(cellText).some(t => t.includes(key))) return PRODUCTS[key];
-    }
-    return null;
+  return true;
+}
+
+// Trailing summary column(s) after the day columns.
+// May-style: single TOTAL column.
+// June-style: PACKED (units total) + LITRES (volume total) side by side.
+function getTotalColIdx(headerRow) {
+  for (let i = 0; i < headerRow.length; i++) {
+    if (cellText(headerRow[i]) === 'TOTAL') return i;
   }
- 
-  // ── state machine ────────────────────────────────────────
+  return -1;
+}
+function getPackedLitresColIdx(headerRow) {
+  let packedIdx = -1, litresIdx = -1;
+  for (let i = 0; i < headerRow.length; i++) {
+    const t = cellText(headerRow[i]);
+    if (t === 'PACKED') packedIdx = i;
+    if (t === 'LITRES') litresIdx = i;
+  }
+  return { packedIdx, litresIdx };
+}
+
+// Known products
+const PRODUCTS = {
+  'VANILLA':      'Vanilla',
+  'STRAWBERRY':   'Strawberry',
+  'MTINDI BONGE': 'Mtindi Bonge',
+  'MTINDI':       'Mtindi Bonge',
+};
+function detectProduct(row) {
+  for (const key of Object.keys(PRODUCTS)) {
+    if (row.map(cellText).some(t => t.includes(key))) return PRODUCTS[key];
+  }
+  return null;
+}
+function detectSize(row) {
+  for (let c = 0; c < Math.min(row.length, 5); c++) {
+    const t = cellText(row[c]);
+    if (!t) continue;
+    if (Object.keys(PRODUCTS).some(k => t.includes(k))) continue;
+    if (['FARM','PURCHASED','GRAND TOTAL','PROCESSED MILK LITRES',
+         'PROCESSED MILK PACKED','PROCESSING MILK LITRES','ISSUED'].some(x => t.includes(x))) continue;
+    if (/^\d+(\.\d+)?(ML|L)$/i.test(t) || t.includes('CHUPA') || t.includes('CUP') ||
+        t.includes('PACT') || /\d+ML/i.test(t)) return t;
+  }
+  return null;
+}
+function detectLabel(rows) {
+  for (const row of rows) {
+    const joined = row.map(cellText).join(' ');
+    const m = joined.match(/(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+\d{4}/);
+    if (m) return m[0].replace(/\s+/g, ' ');
+  }
+  return 'Uploaded';
+}
+
+// Detect the logical section a title row belongs to.
+// Genuine title rows have col0 = null (label sits centred further right).
+// Footer/total rows put the same keywords directly in col0 alongside data
+// and must NOT flip the section — so we guard on col0 being empty first.
+//
+// Two table layouts exist:
+//   'packed'       — separate day-by-day PACKED table (May-style)
+//   'litres'       — separate day-by-day LITRES table (May-style)
+//   'packed_litres'— one combined table: daily units + row-end litres total (June-style)
+function sectionOf(row) {
+  // Footer rows (col0 contains a keyword + numbers) — ignore them
+  if (row[0] != null) {
+    const c0 = cellText(row[0]);
+    if (/PROCESS(ED|ING) MILK/.test(c0)) return null;
+  }
+  const text = row.map(cellText).join(' ');
+  if (text.includes('PROCESSING MILK STOCK') || text.includes('PROCESSED MILK STOCK')) return 'stock';
+  if (text.includes('ISSUED')) return 'issued';
+  if (text.includes('PROCESSED MILK LITRES') || text.includes('PROCESSING MILK LITRES')) return 'litres';
+  if (text.includes('PROCESSED MILK PACKED') || text.includes('PROCESSED MILK  PACKED')) return 'packed';
+  // "PROCESSING MILK <MONTH> <YEAR>" — June-style combined table header
+  if (/PROCESSING MILK\s+(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)/.test(text)) return 'packed_litres';
+  if (text.includes('MILK RESEIVED') || text.includes('MILK RECEIVED')) return 'received';
+  return null;
+}
+
+function parseProcessingSheet(sheet) {
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false });
+
   let section = null;
   let dayCols = [];
-  let totalColIdx = -1;
+  let totalColIdx  = -1;
+  let packedColIdx = -1;
+  let litresColIdx = -1;
   let currentProduct = null;
-  const received = {};   // { day: { farm, purchased } }
-  const packed   = [];   // [{ day, product, size, units }]
-  const litres   = [];   // [{ day, product, size, litres }]
-  const issued   = [];   // [{ day, product, size, units }]
-  const stock    = [];   // [{ product, size, units }]
- 
-  // Detect label (month/year) from the sheet name or first rows
-  let label = 'Uploaded';
- 
+
+  const received = {};
+  const packed   = [];
+  const litres   = [];
+  const issued   = [];
+  const stock    = [];
+  const label    = detectLabel(rows);
+
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     if (!row || row.every(c => c == null)) continue;
 
-    // ── detect label from header rows ──
-    const joined = row.map(cellText).join(' ');
-    const monthMatch = joined.match(/(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+\d{4}/);
-    if (monthMatch && label === 'Uploaded') label = monthMatch[0].replace(/\s+/g, ' ');
-
-    // ── isSummaryTotalRow guard ──
-    // Rows that have numeric values at day column positions AND contain section keywords
-    // are summary/total rows — do NOT flip section for them
-    const isSummaryTotalRow = dayCols.length > 0 && dayCols.some(d => {
-      const v = row[d.idx];
-      return v != null && !isNaN(parseFloat(v)) && parseFloat(v) > 0;
-    });
-
-    // ── detect section change (only on non-summary rows) ──
-    if (!isSummaryTotalRow) {
-      const newSection = sectionOf(row);
-      if (newSection) { section = newSection; currentProduct = null; continue; }
+    // Section title detection (skip if this is a date-header row)
+    if (!isDateHeaderRow(row)) {
+      const ns = sectionOf(row);
+      if (ns) { section = ns; currentProduct = null; continue; }
     }
 
-    // ── detect DATE header row (contains 1 2 3 ... 30) ──
-    const potentialDays = getDayColumns(row);
-    if (potentialDays.length >= 5) {
-      dayCols = potentialDays;
-      totalColIdx = getTotalColIdx(row);
+    // Date-header row — update column mapping
+    if (isDateHeaderRow(row)) {
+      dayCols = getDayColumns(row);
+      totalColIdx  = getTotalColIdx(row);
+      const pl     = getPackedLitresColIdx(row);
+      packedColIdx = pl.packedIdx;
+      litresColIdx = pl.litresIdx;
       continue;
     }
 
     if (!section || !dayCols.length) continue;
 
-    // ── detect product name ──
-    const prod = detectProduct(row);
-    if (prod) currentProduct = prod;
-
-    // ── detect size ──
-    let size = null;
-    for (let c = 0; c < Math.min(row.length, 5); c++) {
-      const t = cellText(row[c]);
-      if (!t) continue;
-      if (Object.keys(PRODUCTS).some(k => t.includes(k))) continue;
-      if (['FARM','PURCHASED','GRAND TOTAL','PROCESSED MILK LITRES',
-           'PROCESSED MILK PACKED','PROCESSING MILK LITRES','ISSUED'].some(x => t.includes(x))) continue;
-      if (/^\d+(\.\d+)?(ML|L)$/i.test(t) || t.includes('CHUPA') || t.includes('CUP') || t.includes('PACT') || /\d+ML/i.test(t)) {
-        size = t; break;
-      }
-    }
- 
-    // ── RECEIVED section ──
+    // ── RECEIVED — no product/size needed, handle before the gate below ──
     if (section === 'received') {
-      const label2 = cellText(row[1]) || cellText(row[0]);
-      if (label2 === 'FARM' || label2.includes('FARM')) {
+      const lbl = cellText(row[1]) || cellText(row[0]);
+      if (lbl.includes('FARM')) {
         for (const d of dayCols) {
           const v = parseFloat(row[d.idx]);
           if (!isNaN(v) && v > 0) {
@@ -1401,7 +1423,7 @@ function parseProcessingSheet(sheet) {
           }
         }
       }
-      if (label2 === 'PURCHASED' || label2.includes('PURCH')) {
+      if (lbl.includes('PURCH')) {
         for (const d of dayCols) {
           const v = parseFloat(row[d.idx]);
           if (!isNaN(v) && v > 0) {
@@ -1410,50 +1432,99 @@ function parseProcessingSheet(sheet) {
           }
         }
       }
+      continue;
     }
- 
-    // ── PACKED section ──
-    if (section === 'packed' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
+
+    // All other sections need a product + size
+    const prod = detectProduct(row);
+    if (prod) currentProduct = prod;
+    const size = detectSize(row);
+    if (!currentProduct || !size || size === 'FARM' || size === 'GRAND TOTAL') continue;
+
+    if (section === 'packed') {
       for (const d of dayCols) {
         const v = parseInt(row[d.idx]);
-        if (!isNaN(v) && v > 0) {
-          packed.push({ day: d.day, product: currentProduct, size, units: v });
-        }
+        if (!isNaN(v) && v > 0) packed.push({ day: d.day, product: currentProduct, size, units: v });
       }
     }
- 
-    // ── LITRES section ──
-    if (section === 'litres' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
+
+    if (section === 'litres') {
       for (const d of dayCols) {
         const v = parseFloat(row[d.idx]);
-        if (!isNaN(v) && v > 0) {
-          litres.push({ day: d.day, product: currentProduct, size, litres: v });
-        }
+        if (!isNaN(v) && v > 0) litres.push({ day: d.day, product: currentProduct, size, litres: v });
       }
     }
- 
-    // ── ISSUED section ──
-    if (section === 'issued' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
+
+    // June-style: daily units in day columns, month-total litres in trailing col
+    if (section === 'packed_litres') {
       for (const d of dayCols) {
         const v = parseInt(row[d.idx]);
-        if (!isNaN(v) && v > 0) {
-          issued.push({ day: d.day, product: currentProduct, size, units: v });
-        }
+        if (!isNaN(v) && v > 0) packed.push({ day: d.day, product: currentProduct, size, units: v });
+      }
+      if (litresColIdx >= 0) {
+        const tl = parseFloat(row[litresColIdx]);
+        if (!isNaN(tl) && tl > 0) litres.push({ day: null, product: currentProduct, size, litres: tl });
       }
     }
- 
-    // ── STOCK section — summarise by product+size (totals, no daily) ──
-    if (section === 'stock' && currentProduct && size && size !== 'FARM' && size !== 'GRAND TOTAL') {
-      // Read from the TOTAL column (tracked from the day-header row)
-      const rawTotal = totalColIdx >= 0 ? row[totalColIdx] : null;
-      const total = parseFloat(rawTotal);
-      if (!isNaN(total) && total > 0) {
-        stock.push({ product: currentProduct, size, units: Math.round(total) });
+
+    if (section === 'issued') {
+      for (const d of dayCols) {
+        const v = parseInt(row[d.idx]);
+        if (!isNaN(v) && v > 0) issued.push({ day: d.day, product: currentProduct, size, units: v });
       }
+    }
+
+    if (section === 'stock') {
+      const rawTotal = totalColIdx >= 0 ? row[totalColIdx]
+                     : packedColIdx >= 0 ? row[packedColIdx] : null;
+      const total = parseFloat(rawTotal);
+      if (!isNaN(total) && total > 0) stock.push({ product: currentProduct, size, units: Math.round(total) });
     }
   }
- 
+
   return { label, received, packed, litres, issued, stock };
+}
+
+// ── DAMAGE sheet parser ("DAMEGE MAY 2026" / "DAMEGE JUNE 2026") ─────
+// Single flat table: product/size rows × day columns + trailing total(s).
+function parseDamageSheet(sheet) {
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false });
+
+  let dayCols      = [];
+  let totalColIdx  = -1;
+  let litresColIdx = -1;
+  let currentProduct = null;
+  const damaged    = [];
+  const label      = detectLabel(rows);
+
+  for (const row of rows) {
+    if (!row || row.every(c => c == null)) continue;
+
+    if (isDateHeaderRow(row)) {
+      dayCols      = getDayColumns(row);
+      totalColIdx  = getTotalColIdx(row);
+      litresColIdx = getPackedLitresColIdx(row).litresIdx;
+      continue;
+    }
+
+    // Skip bottom summary rows ("PROCESSED MILK DAMEGE PACKED / LITRES")
+    const text = row.map(cellText).join(' ');
+    if (text.includes('DAMEGE') || text.includes('DAMAGE')) continue;
+
+    if (!dayCols.length) continue;
+
+    const prod = detectProduct(row);
+    if (prod) currentProduct = prod;
+    const size = detectSize(row);
+    if (!currentProduct || !size) continue;
+
+    for (const d of dayCols) {
+      const v = parseInt(row[d.idx]);
+      if (!isNaN(v) && v > 0) damaged.push({ day: d.day, product: currentProduct, size, units: v });
+    }
+  }
+
+  return { label, damaged };
 }
  
 /* ══════════════════════════════════
@@ -1520,88 +1591,183 @@ app.get('/api/processing/:id', verifyToken, async (req, res) => {
 /* Upload & parse a new xlsx file */
 app.post('/api/processing/upload', verifyToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
- 
-  let parsed;
+
+  // Identify every monthly sheet in the workbook.
+  // A monthly sheet is named exactly "<MONTH> <YEAR>" e.g. "MAY 2026".
+  // SUMMARY / DAMEGE / DAMAGE sheets are excluded here; damage sheets are
+  // matched per-month below.
+  const monthNames = 'JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER';
+  const monthlyRe  = new RegExp(`^(${monthNames})\\s+\\d{4}$`, 'i');
+
+  let wb;
   try {
-    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
-    // Try to find the monthly sheet (not SUMMARY, not empty "sheet")
-    const sheetName =
-      wb.SheetNames.find(n => /^\w+ \d{4}$/i.test(n.trim())) ||
-      wb.SheetNames.find(n => !n.toUpperCase().includes('SUMMARY') && n.toLowerCase() !== 'sheet') ||
-      wb.SheetNames[0];
-    parsed = parseProcessingSheet(wb.Sheets[sheetName]);
+    wb = XLSX.read(req.file.buffer, { type: 'buffer' });
   } catch (err) {
-    return res.status(400).json({ error: 'Failed to parse file: ' + err.message });
+    return res.status(400).json({ error: 'Could not read file: ' + err.message });
   }
- 
-  const client = await pool.connect();
+
+  let monthlySheets = wb.SheetNames.filter(n => monthlyRe.test(n.trim()));
+
+  // Fallback for files where sheets aren't named to the strict pattern
+  if (!monthlySheets.length) {
+    monthlySheets = wb.SheetNames.filter(n => {
+      const up = n.toUpperCase();
+      return !up.includes('SUMMARY') && !up.includes('DAMEGE') &&
+             !up.includes('DAMAGE') && n.toLowerCase() !== 'sheet';
+    });
+  }
+  if (!monthlySheets.length) {
+    return res.status(400).json({ error: 'No processable sheets found in this file.' });
+  }
+
+  // Parse every monthly sheet + its matching DAMEGE sheet
+  const months = [];
+  for (const sheetName of monthlySheets) {
+    try {
+      const parsed = parseProcessingSheet(wb.Sheets[sheetName]);
+      const damageSheetName = wb.SheetNames.find(n => {
+        const up = n.toUpperCase();
+        return (up.includes('DAMEGE') || up.includes('DAMAGE')) &&
+               up.includes(sheetName.toUpperCase());
+      });
+      const damageParsed = damageSheetName
+        ? parseDamageSheet(wb.Sheets[damageSheetName])
+        : null;
+      months.push({ sheetName, parsed, damageParsed });
+    } catch (err) {
+      months.push({ sheetName, error: err.message });
+    }
+  }
+
+  // Persist every month inside one transaction
+  const client  = await pool.connect();
+  const results = [];
+  const globalWarnings = [];
+
   try {
     await client.query('BEGIN');
- 
-    // 1. Create upload record
-    const upRes = await client.query(
-      `INSERT INTO processing_uploads(label, uploaded_by) VALUES($1,$2) RETURNING id`,
-      [parsed.label, req.user.id]
-    );
-    const uploadId = upRes.rows[0].id;
- 
-    // 2. Milk received
-    for (const [day, vals] of Object.entries(parsed.received)) {
-      await client.query(
-        `INSERT INTO processing_milk_received(upload_id, day, farm_litres, purchased_litres)
-         VALUES($1,$2,$3,$4)`,
-        [uploadId, parseInt(day), vals.farm || 0, vals.purchased || 0]
+
+    for (const { sheetName, parsed, damageParsed, error } of months) {
+      if (error) {
+        globalWarnings.push(`Sheet "${sheetName}" failed to parse: ${error}`);
+        continue;
+      }
+
+      // 1. Upload record (one per month)
+      const upRes = await client.query(
+        `INSERT INTO processing_uploads(label, uploaded_by) VALUES($1,$2) RETURNING id`,
+        [parsed.label, req.user.id]
       );
+      const uploadId = upRes.rows[0].id;
+
+      // 2. Milk received
+      for (const [day, vals] of Object.entries(parsed.received)) {
+        await client.query(
+          `INSERT INTO processing_milk_received(upload_id, day, farm_litres, purchased_litres)
+           VALUES($1,$2,$3,$4)`,
+          [uploadId, parseInt(day), vals.farm || 0, vals.purchased || 0]
+        );
+      }
+
+      // 3. Packed + litres
+      // May-style: separate PACKED and LITRES tables, both with daily breakdown.
+      //   Merge by day+product+size.
+      // June-style: one combined table — daily units + month-total litres per row.
+      //   litres entries carry day:null; distribute pro-rata across packed days.
+      const packedMap = {};
+      const monthlyLitresTotals = {};
+
+      for (const r of parsed.packed) {
+        const key = `${r.day}|${r.product}|${r.size}`;
+        packedMap[key] = { day: r.day, product: r.product, size: r.size, units: r.units, litres: 0 };
+      }
+      for (const r of parsed.litres) {
+        if (r.day == null) {
+          monthlyLitresTotals[`${r.product}|${r.size}`] = r.litres;
+          continue;
+        }
+        const key = `${r.day}|${r.product}|${r.size}`;
+        if (packedMap[key]) packedMap[key].litres = r.litres;
+        else packedMap[key] = { day: r.day, product: r.product, size: r.size, units: 0, litres: r.litres };
+      }
+      // Distribute monthly litres totals pro-rata by units packed that day
+      for (const [psKey, totalLitres] of Object.entries(monthlyLitresTotals)) {
+        const [product, size] = psKey.split('|');
+        const rowsForPS = Object.values(packedMap).filter(r => r.product === product && r.size === size);
+        if (!rowsForPS.length) continue;
+        const totalUnits = rowsForPS.reduce((a, r) => a + (r.units || 0), 0);
+        for (const r of rowsForPS) {
+          r.litres = totalUnits > 0
+            ? Math.round((totalLitres * (r.units / totalUnits)) * 100) / 100
+            : Math.round((totalLitres / rowsForPS.length) * 100) / 100;
+        }
+      }
+      for (const r of Object.values(packedMap)) {
+        await client.query(
+          `INSERT INTO processing_packed(upload_id, day, product, size, units, litres)
+           VALUES($1,$2,$3,$4,$5,$6)`,
+          [uploadId, r.day, r.product, r.size, r.units || 0, r.litres || 0]
+        );
+      }
+
+      // 4. Issued
+      for (const r of parsed.issued) {
+        await client.query(
+          `INSERT INTO processing_issued(upload_id, day, product, size, units, litres)
+           VALUES($1,$2,$3,$4,$5,$6)`,
+          [uploadId, r.day, r.product, r.size, r.units || 0, 0]
+        );
+      }
+
+      // 5. Damaged (optional)
+      if (damageParsed) {
+        for (const r of damageParsed.damaged) {
+          await client.query(
+            `INSERT INTO processing_damaged(upload_id, day, product, size, units, litres)
+             VALUES($1,$2,$3,$4,$5,$6)`,
+            [uploadId, r.day, r.product, r.size, r.units || 0, 0]
+          );
+        }
+      }
+
+      // 6. Stock
+      for (const r of parsed.stock) {
+        await client.query(
+          `INSERT INTO processing_stock(upload_id, product, size, units)
+           VALUES($1,$2,$3,$4)`,
+          [uploadId, r.product, r.size, r.units || 0]
+        );
+      }
+
+      // Per-month warnings
+      const warnings = [];
+      if (!Object.keys(parsed.received).length) warnings.push('No "milk received" rows found.');
+      if (!parsed.packed.length)               warnings.push('No "packed" rows found.');
+      if (!parsed.issued.length)               warnings.push('No "issued" rows found.');
+      if (!damageParsed)                       warnings.push('No matching DAMEGE sheet — damaged stock not recorded.');
+
+      results.push({
+        upload_id: uploadId,
+        label:     parsed.label,
+        sheet:     sheetName,
+        summary: {
+          received_days: Object.keys(parsed.received).length,
+          packed_rows:   Object.keys(packedMap).length,
+          issued_rows:   parsed.issued.length,
+          damaged_rows:  damageParsed ? damageParsed.damaged.length : 0,
+          stock_rows:    parsed.stock.length,
+        },
+        warnings,
+      });
     }
- 
-    // 3. Packed units + litres (merge by day+product+size)
-    const packedMap = {};
-    for (const r of parsed.packed) {
-      const key = `${r.day}|${r.product}|${r.size}`;
-      packedMap[key] = { ...r, litres: 0 };
-    }
-    for (const r of parsed.litres) {
-      const key = `${r.day}|${r.product}|${r.size}`;
-      if (packedMap[key]) packedMap[key].litres = r.litres;
-      else packedMap[key] = { day: r.day, product: r.product, size: r.size, units: 0, litres: r.litres };
-    }
-    for (const r of Object.values(packedMap)) {
-      await client.query(
-        `INSERT INTO processing_packed(upload_id, day, product, size, units, litres)
-         VALUES($1,$2,$3,$4,$5,$6)`,
-        [uploadId, r.day, r.product, r.size, r.units || 0, r.litres || 0]
-      );
-    }
- 
-    // 4. Issued
-    for (const r of parsed.issued) {
-      await client.query(
-        `INSERT INTO processing_issued(upload_id, day, product, size, units, litres)
-         VALUES($1,$2,$3,$4,$5,$6)`,
-        [uploadId, r.day, r.product, r.size, r.units || 0, 0]
-      );
-    }
- 
-    // 5. Stock
-    for (const r of parsed.stock) {
-      await client.query(
-        `INSERT INTO processing_stock(upload_id, product, size, units)
-         VALUES($1,$2,$3,$4)`,
-        [uploadId, r.product, r.size, r.units || 0]
-      );
-    }
- 
+
     await client.query('COMMIT');
+
     res.status(201).json({
-      success: true,
-      upload_id: uploadId,
-      label: parsed.label,
-      summary: {
-        received_days: Object.keys(parsed.received).length,
-        packed_rows:   parsed.packed.length,
-        issued_rows:   parsed.issued.length,
-        stock_rows:    parsed.stock.length,
-      },
+      success:         true,
+      months_imported: results.length,
+      months:          results,
+      warnings:        globalWarnings,
     });
   } catch (err) {
     await client.query('ROLLBACK');
