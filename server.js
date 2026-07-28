@@ -8,35 +8,51 @@ const jwt      = require('jsonwebtoken');
 const path     = require('path');
 const mammoth   = require('mammoth');
 const { pool, initDB }           = require('./db');
-const { verifyToken, requireAdmin, SECRET } = require('./auth');
+const {
+  verifyToken, requireAdmin, SECRET,
+  loginRateLimit, recordLoginFailure, clearLoginFailures,
+} = require('./auth');
+const { parseProcessingWorkbook } = require('./processingParser');
+const aiRoutes                    = require('./aiRoutes');
+const { initAiTables }            = require('./aiClient');
 
-const app    = express();
-const upload = multer({ storage: multer.memoryStorage() });
+const app = express();
 
-app.use(cors());
-app.use(express.json());
+/* Uploads are parsed in memory, so cap them — without a limit a single large
+   file can exhaust the process. Imports are spreadsheets and Word documents;
+   10 MB is far above anything the farm actually uploads. */
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 
-app.use(cors({
+/* One CORS policy, applied to both real requests and preflights. A bare
+   cors() call anywhere here would set Access-Control-Allow-Origin: * and
+   silently override the allowlist below, so there must not be one. */
+const corsOptions = {
   origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://bushi-farm.vercel.app'],
-  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
+  credentials: true,
+};
 
-app.options('*', cors());
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use(express.json());
 
 /* ══════════════════════════════════
    AUTH ROUTES  (public)
 ══════════════════════════════════ */
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginRateLimit, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE username=$1', [username.trim()]);
     const user = rows[0];
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!user) { recordLoginFailure(req); return res.status(401).json({ error: 'Invalid credentials' }); }
     const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!ok) { recordLoginFailure(req); return res.status(401).json({ error: 'Invalid credentials' }); }
+    clearLoginFailures(req);
     const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
   } catch (err) {
@@ -63,7 +79,10 @@ app.get('/api/users', verifyToken, requireAdmin, async (req, res) => {
 });
 
 app.post('/api/users', verifyToken, requireAdmin, async (req, res) => {
-  const { username, password, role = ['viewer', 'veteran', 'manager'] } = req.body;
+  /* The default has to be a single role, not the list of allowed ones —
+     defaulting to an array made the includes() check below reject every
+     request that omitted `role`. */
+  const { username, password, role = 'viewer' } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   if (!['admin', 'viewer', 'manager', 'veteran'].includes(role)) return res.status(400).json({ error: 'Role not found' });
   try {
@@ -220,24 +239,6 @@ app.post('/api/records', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/records', verifyToken, requireAdmin, async (req, res) => {
-  const { cow_name, date, litres, notes } = req.body;
-  if (!cow_name || !date || !litres) return res.status(400).json({ error: 'cow_name, date and litres required' });
-  try {
-    const cowRes = await pool.query(
-      'INSERT INTO cows(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING id',
-      [cow_name.trim()]
-    );
-    const { rows } = await pool.query(
-      `INSERT INTO milk_records(cow_id,date,litres,notes) VALUES($1,$2,$3,$4)
-       ON CONFLICT(cow_id,date) DO UPDATE SET litres=EXCLUDED.litres, notes=EXCLUDED.notes RETURNING *`,
-      [cowRes.rows[0].id, date, litres, notes||null]
-    );
-    res.status(201).json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.delete('/api/records/:id', verifyToken, requireAdmin, async (req, res) => {
   try {
@@ -426,7 +427,8 @@ app.get('/api/diseases', verifyToken, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT d.id, d.name, d.description, TO_CHAR(d.date,'YYYY-MM-DD') AS date, d.notes,
         COALESCE(JSON_AGG(DISTINCT JSONB_BUILD_OBJECT('id', c.id, 'name', c.name)) FILTER (WHERE c.id IS NOT NULL), '[]') AS affected_cows,
-        COALESCE(JSON_AGG(DISTINCT JSONB_BUILD_OBJECT('id', t.id, 'medicine', t.medicine_name, 'dosage', t.dosage, 'date', TO_CHAR(t.date,'YYYY-MM-DD'), 'notes', t.notes)) FILTER (WHERE t.id IS NOT NULL), '[]'::json) AS treatments
+        COALESCE(JSON_AGG(DISTINCT JSONB_BUILD_OBJECT('id', t.id, 'medicine', t.medicine_name, 'dosage', t.dosage, 'date', TO_CHAR(t.date,'YYYY-MM-DD'), 'notes', t.notes)) FILTER (WHERE t.id IS NOT NULL), '[]'::json) AS treatments,
+        COUNT(DISTINCT t.id)::int AS treatment_count
       FROM diseases d
       LEFT JOIN disease_cows dc ON dc.disease_id = d.id
       LEFT JOIN cows c ON c.id = dc.cow_id
@@ -543,7 +545,7 @@ app.delete('/api/cow-history/:id', verifyToken, requireAdmin, async (req, res) =
 app.get('/api/pregnancies', verifyToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT p.id, p.cow_id, c.name AS cow_name,
+      SELECT p.id, p.cow_id, c.name AS cow_name, c.tag AS cow_tag,
         TO_CHAR(p.conception_date,'YYYY-MM-DD')    AS conception_date,
         TO_CHAR(p.expected_due_date,'YYYY-MM-DD')  AS expected_due_date,
         TO_CHAR(p.actual_birth_date,'YYYY-MM-DD')  AS actual_birth_date,
@@ -1009,77 +1011,20 @@ app.post('/api/inventory/import', verifyToken, requireAdmin, upload.single('file
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+
+
+
 /* ══════════════════════════════════
-   DISEASES & TREATMENTS
+   LATE ADDITIONS
+
+   The two handlers below have no counterpart in the sections above. The rest
+   of this block used to be second copies of routes already registered earlier
+   in the file, which Express never reached — they have been removed.
 ══════════════════════════════════ */
-app.get('/api/diseases', verifyToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT d.*,
-        TO_CHAR(d.date,'YYYY-MM-DD') AS date,
-        ARRAY_AGG(DISTINCT dc.cow_id) FILTER (WHERE dc.cow_id IS NOT NULL) AS affected_cow_ids,
-        ARRAY_AGG(DISTINCT c.name)    FILTER (WHERE c.name IS NOT NULL)    AS affected_cow_names,
-        COUNT(DISTINCT t.id)::int AS treatment_count
-      FROM diseases d
-      LEFT JOIN disease_cows dc ON dc.disease_id = d.id
-      LEFT JOIN cows c ON c.id = dc.cow_id
-      LEFT JOIN treatments t ON t.disease_id = d.id
-      GROUP BY d.id ORDER BY d.date DESC
-    `);
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-app.post('/api/diseases', verifyToken, async (req, res) => {
-  const { name, description, date, cow_ids = [] } = req.body;
-  if (!name || !date) return res.status(400).json({ error: 'name and date required' });
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const { rows } = await client.query(
-      `INSERT INTO diseases(name, description, date) VALUES($1,$2,$3) RETURNING *`,
-      [name.trim(), description || null, date]
-    );
-    const disease = rows[0];
-    for (const cow_id of cow_ids) {
-      await client.query(`INSERT INTO disease_cows(disease_id, cow_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, [disease.id, cow_id]);
-    }
-    await client.query('COMMIT');
-    res.status(201).json(disease);
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  } finally { client.release(); }
-});
-
-app.patch('/api/diseases/:id', verifyToken, async (req, res) => {
-  const { name, description, date, cow_ids = [] } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const { rows } = await client.query(
-      `UPDATE diseases SET name=$1, description=$2, date=$3 WHERE id=$4 RETURNING *`,
-      [name, description || null, date, req.params.id]
-    );
-    await client.query(`DELETE FROM disease_cows WHERE disease_id=$1`, [req.params.id]);
-    for (const cow_id of cow_ids) {
-      await client.query(`INSERT INTO disease_cows(disease_id, cow_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, [req.params.id, cow_id]);
-    }
-    await client.query('COMMIT');
-    res.json(rows[0]);
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  } finally { client.release(); }
-});
-
-app.delete('/api/diseases/:id', verifyToken, requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM diseases WHERE id=$1', [req.params.id]);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
+/* Treatments for a single disease. The disease list already embeds them, but
+   the Health page's treatment modal fetches them on their own. */
 app.get('/api/diseases/:id/treatments', verifyToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -1090,50 +1035,12 @@ app.get('/api/diseases/:id/treatments', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/diseases/:id/treatments', verifyToken, async (req, res) => {
-  const { medicine_name, dosage, date, notes } = req.body;
-  if (!medicine_name || !date) return res.status(400).json({ error: 'medicine_name and date required' });
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO treatments(disease_id,medicine_name,dosage,date,notes) VALUES($1,$2,$3,$4,$5) RETURNING *`,
-      [req.params.id, medicine_name.trim(), dosage || null, date, notes || null]
-    );
-    res.status(201).json(rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-app.delete('/api/treatments/:id', verifyToken, requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM treatments WHERE id=$1', [req.params.id]);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-/* ══════════════════════════════════
-   COW HISTORY
-══════════════════════════════════ */
-app.get('/api/cows/:id/history', verifyToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT *, TO_CHAR(date,'YYYY-MM-DD') AS date FROM cow_history WHERE cow_id=$1 ORDER BY date DESC`,
-      [req.params.id]
-    );
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-app.post('/api/cows/:id/history', verifyToken, async (req, res) => {
-  const { event_type, date, source, notes } = req.body;
-  if (!event_type || !date) return res.status(400).json({ error: 'event_type and date required' });
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO cow_history(cow_id,event_type,date,source,notes) VALUES($1,$2,$3,$4,$5) RETURNING *`,
-      [req.params.id, event_type, date, source || null, notes || null]
-    );
-    res.status(201).json(rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
+/* Nested delete for a cow history entry. The UI uses DELETE /api/cow-history/:id
+   instead; this variant is kept for any caller that scopes by cow. */
 app.delete('/api/cows/:id/history/:hid', verifyToken, requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM cow_history WHERE id=$1 AND cow_id=$2', [req.params.hid, req.params.id]);
@@ -1141,55 +1048,9 @@ app.delete('/api/cows/:id/history/:hid', verifyToken, requireAdmin, async (req, 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/* ══════════════════════════════════
-   PREGNANCIES
-══════════════════════════════════ */
-app.get('/api/pregnancies', verifyToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT p.*, c.name AS cow_name, c.tag AS cow_tag,
-        TO_CHAR(p.conception_date,'YYYY-MM-DD')   AS conception_date,
-        TO_CHAR(p.expected_due_date,'YYYY-MM-DD') AS expected_due_date,
-        TO_CHAR(p.actual_birth_date,'YYYY-MM-DD') AS actual_birth_date,
-        (p.expected_due_date - CURRENT_DATE)::int AS days_remaining
-      FROM pregnancies p JOIN cows c ON c.id = p.cow_id
-      ORDER BY p.expected_due_date ASC
-    `);
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-app.post('/api/pregnancies', verifyToken, async (req, res) => {
-  const { cow_id, conception_date, notes } = req.body;
-  if (!cow_id || !conception_date) return res.status(400).json({ error: 'cow_id and conception_date required' });
-  // Expected due date = conception + 283 days (average gestation for cattle)
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO pregnancies(cow_id, conception_date, expected_due_date, notes)
-       VALUES($1,$2,$2::date + INTERVAL '283 days',$3) RETURNING *`,
-      [cow_id, conception_date, notes || null]
-    );
-    res.status(201).json(rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-app.patch('/api/pregnancies/:id', verifyToken, async (req, res) => {
-  const { status, actual_birth_date, notes } = req.body;
-  try {
-    const { rows } = await pool.query(
-      `UPDATE pregnancies SET status=$1, actual_birth_date=$2, notes=$3 WHERE id=$4 RETURNING *`,
-      [status, actual_birth_date || null, notes || null, req.params.id]
-    );
-    res.json(rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-app.delete('/api/pregnancies/:id', verifyToken, requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM pregnancies WHERE id=$1', [req.params.id]);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
 /* ══════════════════════════════════
    DAILY ALERTS
@@ -1269,264 +1130,6 @@ app.get('/api/alerts/daily', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── shared helpers ───────────────────────────────────────────────────
-const cellText = (v) => (v == null ? '' : String(v).trim().toUpperCase());
-
-// A real date-header row lists days 1, 2, 3 … strictly in order starting
-// at 1. Ordinary data rows can contain 5+ values in the 1–31 range by
-// coincidence (units, litres) and must NOT be treated as a new header.
-function getDayColumns(headerRow) {
-  const cols = [];
-  headerRow.forEach((cell, idx) => {
-    const n = parseInt(cell);
-    if (!isNaN(n) && n >= 1 && n <= 31) cols.push({ day: n, idx });
-  });
-  return cols;
-}
-function isDateHeaderRow(headerRow) {
-  const cols = getDayColumns(headerRow);
-  if (cols.length < 5) return false;
-  if (cols[0].day !== 1) return false;
-  for (let i = 1; i < cols.length; i++) {
-    if (cols[i].day !== cols[i - 1].day + 1) return false;
-  }
-  return true;
-}
-
-// Trailing summary column(s) after the day columns.
-// May-style: single TOTAL column.
-// June-style: PACKED (units total) + LITRES (volume total) side by side.
-function getTotalColIdx(headerRow) {
-  for (let i = 0; i < headerRow.length; i++) {
-    if (cellText(headerRow[i]) === 'TOTAL') return i;
-  }
-  return -1;
-}
-function getPackedLitresColIdx(headerRow) {
-  let packedIdx = -1, litresIdx = -1;
-  for (let i = 0; i < headerRow.length; i++) {
-    const t = cellText(headerRow[i]);
-    if (t === 'PACKED') packedIdx = i;
-    if (t === 'LITRES') litresIdx = i;
-  }
-  return { packedIdx, litresIdx };
-}
-
-// Known products
-const PRODUCTS = {
-  'VANILLA':      'Vanilla',
-  'STRAWBERRY':   'Strawberry',
-  'MTINDI BONGE': 'Mtindi Bonge',
-  'MTINDI':       'Mtindi Bonge',
-};
-function detectProduct(row) {
-  for (const key of Object.keys(PRODUCTS)) {
-    if (row.map(cellText).some(t => t.includes(key))) return PRODUCTS[key];
-  }
-  return null;
-}
-function detectSize(row) {
-  for (let c = 0; c < Math.min(row.length, 5); c++) {
-    const t = cellText(row[c]);
-    if (!t) continue;
-    if (Object.keys(PRODUCTS).some(k => t.includes(k))) continue;
-    if (['FARM','PURCHASED','GRAND TOTAL','PROCESSED MILK LITRES',
-         'PROCESSED MILK PACKED','PROCESSING MILK LITRES','ISSUED'].some(x => t.includes(x))) continue;
-    if (/^\d+(\.\d+)?(ML|L)$/i.test(t) || t.includes('CHUPA') || t.includes('CUP') ||
-        t.includes('PACT') || /\d+ML/i.test(t)) return t;
-  }
-  return null;
-}
-function detectLabel(rows) {
-  for (const row of rows) {
-    const joined = row.map(cellText).join(' ');
-    const m = joined.match(/(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+\d{4}/);
-    if (m) return m[0].replace(/\s+/g, ' ');
-  }
-  return 'Uploaded';
-}
-
-// Detect the logical section a title row belongs to.
-// Genuine title rows have col0 = null (label sits centred further right).
-// Footer/total rows put the same keywords directly in col0 alongside data
-// and must NOT flip the section — so we guard on col0 being empty first.
-//
-// Two table layouts exist:
-//   'packed'       — separate day-by-day PACKED table (May-style)
-//   'litres'       — separate day-by-day LITRES table (May-style)
-//   'packed_litres'— one combined table: daily units + row-end litres total (June-style)
-function sectionOf(row) {
-  // Footer rows (col0 contains a keyword + numbers) — ignore them
-  if (row[0] != null) {
-    const c0 = cellText(row[0]);
-    if (/PROCESS(ED|ING) MILK/.test(c0)) return null;
-  }
-  const text = row.map(cellText).join(' ');
-  if (text.includes('PROCESSING MILK STOCK') || text.includes('PROCESSED MILK STOCK')) return 'stock';
-  if (text.includes('ISSUED')) return 'issued';
-  if (text.includes('PROCESSED MILK LITRES') || text.includes('PROCESSING MILK LITRES')) return 'litres';
-  if (text.includes('PROCESSED MILK PACKED') || text.includes('PROCESSED MILK  PACKED')) return 'packed';
-  // "PROCESSING MILK <MONTH> <YEAR>" — June-style combined table header
-  if (/PROCESSING MILK\s+(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)/.test(text)) return 'packed_litres';
-  if (text.includes('MILK RESEIVED') || text.includes('MILK RECEIVED')) return 'received';
-  return null;
-}
-
-function parseProcessingSheet(sheet) {
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false });
-
-  let section = null;
-  let dayCols = [];
-  let totalColIdx  = -1;
-  let packedColIdx = -1;
-  let litresColIdx = -1;
-  let currentProduct = null;
-
-  const received = {};
-  const packed   = [];
-  const litres   = [];
-  const issued   = [];
-  const stock    = [];
-  const label    = detectLabel(rows);
-
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    if (!row || row.every(c => c == null)) continue;
-
-    // Section title detection (skip if this is a date-header row)
-    if (!isDateHeaderRow(row)) {
-      const ns = sectionOf(row);
-      if (ns) { section = ns; currentProduct = null; continue; }
-    }
-
-    // Date-header row — update column mapping
-    if (isDateHeaderRow(row)) {
-      dayCols = getDayColumns(row);
-      totalColIdx  = getTotalColIdx(row);
-      const pl     = getPackedLitresColIdx(row);
-      packedColIdx = pl.packedIdx;
-      litresColIdx = pl.litresIdx;
-      continue;
-    }
-
-    if (!section || !dayCols.length) continue;
-
-    // ── RECEIVED — no product/size needed, handle before the gate below ──
-    if (section === 'received') {
-      const lbl = cellText(row[1]) || cellText(row[0]);
-      if (lbl.includes('FARM')) {
-        for (const d of dayCols) {
-          const v = parseFloat(row[d.idx]);
-          if (!isNaN(v) && v > 0) {
-            if (!received[d.day]) received[d.day] = { farm: 0, purchased: 0 };
-            received[d.day].farm = v;
-          }
-        }
-      }
-      if (lbl.includes('PURCH')) {
-        for (const d of dayCols) {
-          const v = parseFloat(row[d.idx]);
-          if (!isNaN(v) && v > 0) {
-            if (!received[d.day]) received[d.day] = { farm: 0, purchased: 0 };
-            received[d.day].purchased = v;
-          }
-        }
-      }
-      continue;
-    }
-
-    // All other sections need a product + size
-    const prod = detectProduct(row);
-    if (prod) currentProduct = prod;
-    const size = detectSize(row);
-    if (!currentProduct || !size || size === 'FARM' || size === 'GRAND TOTAL') continue;
-
-    if (section === 'packed') {
-      for (const d of dayCols) {
-        const v = parseInt(row[d.idx]);
-        if (!isNaN(v) && v > 0) packed.push({ day: d.day, product: currentProduct, size, units: v });
-      }
-    }
-
-    if (section === 'litres') {
-      for (const d of dayCols) {
-        const v = parseFloat(row[d.idx]);
-        if (!isNaN(v) && v > 0) litres.push({ day: d.day, product: currentProduct, size, litres: v });
-      }
-    }
-
-    // June-style: daily units in day columns, month-total litres in trailing col
-    if (section === 'packed_litres') {
-      for (const d of dayCols) {
-        const v = parseInt(row[d.idx]);
-        if (!isNaN(v) && v > 0) packed.push({ day: d.day, product: currentProduct, size, units: v });
-      }
-      if (litresColIdx >= 0) {
-        const tl = parseFloat(row[litresColIdx]);
-        if (!isNaN(tl) && tl > 0) litres.push({ day: null, product: currentProduct, size, litres: tl });
-      }
-    }
-
-    if (section === 'issued') {
-      for (const d of dayCols) {
-        const v = parseInt(row[d.idx]);
-        if (!isNaN(v) && v > 0) issued.push({ day: d.day, product: currentProduct, size, units: v });
-      }
-    }
-
-    if (section === 'stock') {
-      const rawTotal = totalColIdx >= 0 ? row[totalColIdx]
-                     : packedColIdx >= 0 ? row[packedColIdx] : null;
-      const total = parseFloat(rawTotal);
-      if (!isNaN(total) && total > 0) stock.push({ product: currentProduct, size, units: Math.round(total) });
-    }
-  }
-
-  return { label, received, packed, litres, issued, stock };
-}
-
-// ── DAMAGE sheet parser ("DAMEGE MAY 2026" / "DAMEGE JUNE 2026") ─────
-// Single flat table: product/size rows × day columns + trailing total(s).
-function parseDamageSheet(sheet) {
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false });
-
-  let dayCols      = [];
-  let totalColIdx  = -1;
-  let litresColIdx = -1;
-  let currentProduct = null;
-  const damaged    = [];
-  const label      = detectLabel(rows);
-
-  for (const row of rows) {
-    if (!row || row.every(c => c == null)) continue;
-
-    if (isDateHeaderRow(row)) {
-      dayCols      = getDayColumns(row);
-      totalColIdx  = getTotalColIdx(row);
-      litresColIdx = getPackedLitresColIdx(row).litresIdx;
-      continue;
-    }
-
-    // Skip bottom summary rows ("PROCESSED MILK DAMEGE PACKED / LITRES")
-    const text = row.map(cellText).join(' ');
-    if (text.includes('DAMEGE') || text.includes('DAMAGE')) continue;
-
-    if (!dayCols.length) continue;
-
-    const prod = detectProduct(row);
-    if (prod) currentProduct = prod;
-    const size = detectSize(row);
-    if (!currentProduct || !size) continue;
-
-    for (const d of dayCols) {
-      const v = parseInt(row[d.idx]);
-      if (!isNaN(v) && v > 0) damaged.push({ day: d.day, product: currentProduct, size, units: v });
-    }
-  }
-
-  return { label, damaged };
-}
- 
 /* ══════════════════════════════════
    GET  /api/processing               — list all uploads
    GET  /api/processing/:id           — full data for one upload
@@ -1588,176 +1191,135 @@ app.get('/api/processing/:id', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
  
-/* Upload & parse a new xlsx file */
+/* Upload & parse a new processing workbook (xlsx)
+
+   Uses the structured template parser (processingParser.js). The workbook
+   holds one sheet per month; each month sheet stacks the four sections
+   (RECEIVED, PROCESSED, PACKED, ISSUED). Records are located by fixed
+   anchors, so nothing is silently dropped — a layout problem returns a 422
+   listing exactly what is wrong instead of importing partial data.
+
+   Re-uploading a month REPLACES that month's existing records (clean
+   per-month overwrite), so an updated workbook can be re-submitted safely.  */
 app.post('/api/processing/upload', verifyToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  // Identify every monthly sheet in the workbook.
-  // A monthly sheet is named exactly "<MONTH> <YEAR>" e.g. "MAY 2026".
-  // SUMMARY / DAMEGE / DAMAGE sheets are excluded here; damage sheets are
-  // matched per-month below.
-  const monthNames = 'JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER';
-  const monthlyRe  = new RegExp(`^(${monthNames})\\s+\\d{4}$`, 'i');
+  // Parse the whole workbook by structure. Blank cells are ignored; any
+  // altered label, missing row, or bad value is collected as an error.
+  const parsed = parseProcessingWorkbook(req.file.buffer);
 
-  let wb;
-  try {
-    wb = XLSX.read(req.file.buffer, { type: 'buffer' });
-  } catch (err) {
-    return res.status(400).json({ error: 'Could not read file: ' + err.message });
-  }
-
-  let monthlySheets = wb.SheetNames.filter(n => monthlyRe.test(n.trim()));
-
-  // Fallback for files where sheets aren't named to the strict pattern
-  if (!monthlySheets.length) {
-    monthlySheets = wb.SheetNames.filter(n => {
-      const up = n.toUpperCase();
-      return !up.includes('SUMMARY') && !up.includes('DAMEGE') &&
-             !up.includes('DAMAGE') && n.toLowerCase() !== 'sheet';
+  // Hard stop on structural problems — do not import partial/ambiguous data.
+  if (!parsed.ok) {
+    return res.status(422).json({
+      error:  'The workbook could not be imported. Fix the issues below and re-upload.',
+      issues: parsed.errors,
     });
   }
-  if (!monthlySheets.length) {
-    return res.status(400).json({ error: 'No processable sheets found in this file.' });
+  if (!parsed.records.length) {
+    return res.status(400).json({ error: 'No data found in the workbook.' });
   }
 
-  // Parse every monthly sheet + its matching DAMEGE sheet
-  const months = [];
-  for (const sheetName of monthlySheets) {
-    try {
-      const parsed = parseProcessingSheet(wb.Sheets[sheetName]);
-      const damageSheetName = wb.SheetNames.find(n => {
-        const up = n.toUpperCase();
-        return (up.includes('DAMEGE') || up.includes('DAMAGE')) &&
-               up.includes(sheetName.toUpperCase());
-      });
-      const damageParsed = damageSheetName
-        ? parseDamageSheet(wb.Sheets[damageSheetName])
-        : null;
-      months.push({ sheetName, parsed, damageParsed });
-    } catch (err) {
-      months.push({ sheetName, error: err.message });
-    }
+  // Group the flat record stream by month (label = "JUNE 2026").
+  // Each record: { month, monthNum, year, section, group, category, day, quantity }
+  const byMonth = new Map();
+  for (const r of parsed.records) {
+    const label = `${r.month} ${r.year}`;
+    if (!byMonth.has(label)) byMonth.set(label, []);
+    byMonth.get(label).push(r);
   }
 
-  // Persist every month inside one transaction
   const client  = await pool.connect();
   const results = [];
-  const globalWarnings = [];
 
   try {
     await client.query('BEGIN');
 
-    for (const { sheetName, parsed, damageParsed, error } of months) {
-      if (error) {
-        globalWarnings.push(`Sheet "${sheetName}" failed to parse: ${error}`);
-        continue;
-      }
+    for (const [label, records] of byMonth) {
+      // ── Replace: wipe any existing upload(s) for this month first. ──
+      // ON DELETE CASCADE on the child tables clears their rows too.
+      await client.query('DELETE FROM processing_uploads WHERE label=$1', [label]);
 
-      // 1. Upload record (one per month)
+      // Fresh upload row for the month.
       const upRes = await client.query(
-        `INSERT INTO processing_uploads(label, uploaded_by) VALUES($1,$2) RETURNING id`,
-        [parsed.label, req.user.id]
+        'INSERT INTO processing_uploads(label, uploaded_by) VALUES($1,$2) RETURNING id',
+        [label, req.user.id]
       );
       const uploadId = upRes.rows[0].id;
 
-      // 2. Milk received
-      for (const [day, vals] of Object.entries(parsed.received)) {
+      // ── Bucket this month's records by section. ──
+      // RECEIVED  -> processing_milk_received (farm_litres, purchased_litres)
+      // PROCESSED -> processing_packed        (units)   [what was made]
+      // ISSUED    -> processing_issued        (units)   [what went out]
+      // PACKED    -> processing_stock         (units)   [current packed stock]
+      const receivedByDay = {};                 // day -> { farm, purchased }
+      const packed = [], issued = [], stockByKey = {};
+
+      for (const r of records) {
+        if (r.section === 'RECEIVED') {
+          if (!receivedByDay[r.day]) receivedByDay[r.day] = { farm: 0, purchased: 0 };
+          // Template splits farm into two sources; the table has one column.
+          if (r.category === 'PURCHASED') receivedByDay[r.day].purchased += r.quantity;
+          else                            receivedByDay[r.day].farm      += r.quantity;
+
+        } else if (r.section === 'PROCESSED') {
+          packed.push({ day: r.day, product: r.group, size: r.category, units: r.quantity });
+
+        } else if (r.section === 'ISSUED') {
+          issued.push({ day: r.day, product: r.group, size: r.category, units: r.quantity });
+
+        } else if (r.section === 'PACKED') {
+          // Stock is a month total per product/size, not per-day.
+          const key = `${r.group}|${r.category}`;
+          stockByKey[key] = (stockByKey[key] || 0) + r.quantity;
+        }
+      }
+
+      // 1. Milk received
+      for (const [day, v] of Object.entries(receivedByDay)) {
         await client.query(
           `INSERT INTO processing_milk_received(upload_id, day, farm_litres, purchased_litres)
            VALUES($1,$2,$3,$4)`,
-          [uploadId, parseInt(day), vals.farm || 0, vals.purchased || 0]
+          [uploadId, parseInt(day, 10), v.farm, v.purchased]
         );
       }
 
-      // 3. Packed + litres
-      // May-style: separate PACKED and LITRES tables, both with daily breakdown.
-      //   Merge by day+product+size.
-      // June-style: one combined table — daily units + month-total litres per row.
-      //   litres entries carry day:null; distribute pro-rata across packed days.
-      const packedMap = {};
-      const monthlyLitresTotals = {};
-
-      for (const r of parsed.packed) {
-        const key = `${r.day}|${r.product}|${r.size}`;
-        packedMap[key] = { day: r.day, product: r.product, size: r.size, units: r.units, litres: 0 };
-      }
-      for (const r of parsed.litres) {
-        if (r.day == null) {
-          monthlyLitresTotals[`${r.product}|${r.size}`] = r.litres;
-          continue;
-        }
-        const key = `${r.day}|${r.product}|${r.size}`;
-        if (packedMap[key]) packedMap[key].litres = r.litres;
-        else packedMap[key] = { day: r.day, product: r.product, size: r.size, units: 0, litres: r.litres };
-      }
-      // Distribute monthly litres totals pro-rata by units packed that day
-      for (const [psKey, totalLitres] of Object.entries(monthlyLitresTotals)) {
-        const [product, size] = psKey.split('|');
-        const rowsForPS = Object.values(packedMap).filter(r => r.product === product && r.size === size);
-        if (!rowsForPS.length) continue;
-        const totalUnits = rowsForPS.reduce((a, r) => a + (r.units || 0), 0);
-        for (const r of rowsForPS) {
-          r.litres = totalUnits > 0
-            ? Math.round((totalLitres * (r.units / totalUnits)) * 100) / 100
-            : Math.round((totalLitres / rowsForPS.length) * 100) / 100;
-        }
-      }
-      for (const r of Object.values(packedMap)) {
+      // 2. Processed (packed daily units)
+      for (const r of packed) {
         await client.query(
           `INSERT INTO processing_packed(upload_id, day, product, size, units, litres)
            VALUES($1,$2,$3,$4,$5,$6)`,
-          [uploadId, r.day, r.product, r.size, r.units || 0, r.litres || 0]
+          [uploadId, r.day, r.product, r.size, r.units, 0]
         );
       }
 
-      // 4. Issued
-      for (const r of parsed.issued) {
+      // 3. Issued
+      for (const r of issued) {
         await client.query(
           `INSERT INTO processing_issued(upload_id, day, product, size, units, litres)
            VALUES($1,$2,$3,$4,$5,$6)`,
-          [uploadId, r.day, r.product, r.size, r.units || 0, 0]
+          [uploadId, r.day, r.product, r.size, r.units, 0]
         );
       }
 
-      // 5. Damaged (optional)
-      if (damageParsed) {
-        for (const r of damageParsed.damaged) {
-          await client.query(
-            `INSERT INTO processing_damaged(upload_id, day, product, size, units, litres)
-             VALUES($1,$2,$3,$4,$5,$6)`,
-            [uploadId, r.day, r.product, r.size, r.units || 0, 0]
-          );
-        }
-      }
-
-      // 6. Stock
-      for (const r of parsed.stock) {
+      // 4. Stock (month totals per product/size)
+      for (const [key, units] of Object.entries(stockByKey)) {
+        const [product, size] = key.split('|');
         await client.query(
           `INSERT INTO processing_stock(upload_id, product, size, units)
            VALUES($1,$2,$3,$4)`,
-          [uploadId, r.product, r.size, r.units || 0]
+          [uploadId, product, size, units]
         );
       }
 
-      // Per-month warnings
-      const warnings = [];
-      if (!Object.keys(parsed.received).length) warnings.push('No "milk received" rows found.');
-      if (!parsed.packed.length)               warnings.push('No "packed" rows found.');
-      if (!parsed.issued.length)               warnings.push('No "issued" rows found.');
-      if (!damageParsed)                       warnings.push('No matching DAMEGE sheet — damaged stock not recorded.');
-
       results.push({
         upload_id: uploadId,
-        label:     parsed.label,
-        sheet:     sheetName,
+        label,
         summary: {
-          received_days: Object.keys(parsed.received).length,
-          packed_rows:   Object.keys(packedMap).length,
-          issued_rows:   parsed.issued.length,
-          damaged_rows:  damageParsed ? damageParsed.damaged.length : 0,
-          stock_rows:    parsed.stock.length,
+          received_days: Object.keys(receivedByDay).length,
+          packed_rows:   packed.length,
+          issued_rows:   issued.length,
+          stock_rows:    Object.keys(stockByKey).length,
         },
-        warnings,
       });
     }
 
@@ -1767,7 +1329,6 @@ app.post('/api/processing/upload', verifyToken, upload.single('file'), async (re
       success:         true,
       months_imported: results.length,
       months:          results,
-      warnings:        globalWarnings,
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -2120,11 +1681,18 @@ app.delete('/api/health-records/:id', verifyToken, requireAdmin, async (req, res
 });
 
 /* ══════════════════════════════════
+   AI REPORTS  (see aiRoutes.js)
+══════════════════════════════════ */
+app.use('/api/ai', aiRoutes);
+
+/* ══════════════════════════════════
    START (Updated for Vercel)
 ══════════════════════════════════ */
 
 // 1. Initialize the DB immediately (top level)
-initDB().catch(err => console.error('DB Init Error:', err.message));
+initDB()
+  .then(initAiTables)
+  .catch(err => console.error('DB Init Error:', err.message));
 
 // 2. EXPORT the app (Mandatory for Vercel)
 module.exports = app;

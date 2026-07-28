@@ -132,6 +132,21 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_proc_stock_upload ON processing_stock(upload_id);
     `);
 
+    /* ── Migrations ──────────────────────────────────────────────────
+       CREATE TABLE IF NOT EXISTS does nothing to a table that already
+       exists, so any schema change made after a database was first created
+       has to be applied explicitly here. Keep every statement idempotent so
+       this block is safe to run on every boot. */
+
+    /* The role list grew to include 'manager' and 'veteran'. Databases created
+       before that change kept the original two-value constraint, which made
+       the Users page fail with users_role_check on those two roles. */
+    await client.query(`
+      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+      ALTER TABLE users ADD CONSTRAINT users_role_check
+        CHECK (role IN ('admin', 'viewer', 'manager', 'veteran'));
+    `);
+
     /* Seed a default admin if no users exist yet */
     const { rows } = await client.query('SELECT COUNT(*) FROM users');
     if (parseInt(rows[0].count) === 0) {
