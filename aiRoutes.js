@@ -1,5 +1,5 @@
 /* ══════════════════════════════════════════════════════════════
-   AI ROUTES  —  mounted at /api/ai
+   AI ROUTES  —  mounted at /api/ai  (admin only, see the gate below)
 
    GET    /api/ai/status                 is AI configured?
    POST   /api/ai/reports/period         narrative period report   (SSE)
@@ -24,18 +24,17 @@ const ai  = require('./aiClient');
 const router = express.Router();
 
 /* ══════════════════════════════════
-   HELPERS
+   ADMIN ONLY
+
+   Every AI surface reads across the whole farm — production, health, sales,
+   inventory and processing together — so none of it can be handed to a role
+   that is restricted to one of those areas. A vet with chat access could just
+   ask what last month's sales were. Rather than scope each report and tool per
+   role, the entire router is limited to admins, who can already see all of it.
+
+   This gate covers every route below, including any added later.
 ══════════════════════════════════ */
-
-/** Roles allowed to spend tokens generating reports. */
-const CAN_GENERATE = ['admin', 'manager', 'veteran'];
-
-function requireGenerator(req, res, next) {
-  if (!CAN_GENERATE.includes(req.user?.role)) {
-    return res.status(403).json({ error: 'You do not have permission to generate AI reports' });
-  }
-  next();
-}
+router.use(verifyToken, requireAdmin);
 
 /** Reject early with a clear message when the API key is missing. */
 function requireAi(req, res, next) {
@@ -151,7 +150,8 @@ router.get('/status', verifyToken, (req, res) => {
   res.json({
     configured: ai.aiConfigured(),
     model: ai.MODEL,
-    can_generate: CAN_GENERATE.includes(req.user?.role),
+    /* The router is admin-only, so anyone who reaches this can generate. */
+    can_generate: true,
   });
 });
 
@@ -199,7 +199,7 @@ Omit any section where the data is genuinely empty, apart from Headline and
 What to do next, which are always required.
 `.trim();
 
-router.post('/reports/period', verifyToken, requireAi, requireGenerator, async (req, res) => {
+router.post('/reports/period', verifyToken, requireAi, async (req, res) => {
   let snapshot;
   try {
     snapshot = await ctx.farmSnapshot({ from: req.body?.from, to: req.body?.to });
@@ -324,7 +324,7 @@ router.get('/briefing', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/briefing', verifyToken, requireAi, requireGenerator, buildBriefing);
+router.post('/briefing', verifyToken, requireAi, buildBriefing);
 
 /* ══════════════════════════════════
    PER-COW HEALTH SUMMARY
@@ -380,7 +380,7 @@ router.get('/cows/:id/summary', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/cows/:id/summary', verifyToken, requireAi, requireGenerator, async (req, res) => {
+router.post('/cows/:id/summary', verifyToken, requireAi, async (req, res) => {
   const cowId = parseInt(req.params.id, 10);
   if (!Number.isInteger(cowId)) return res.status(400).json({ error: 'Invalid cow id' });
 

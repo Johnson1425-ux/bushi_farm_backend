@@ -9,7 +9,8 @@ const path     = require('path');
 const mammoth   = require('mammoth');
 const { pool, initDB }           = require('./db');
 const {
-  verifyToken, requireAdmin, SECRET,
+  verifyToken, SECRET, ROLES,
+  requireAdmin, requireProduction, requireHealth, requireRoleForWrites,
   loginRateLimit, recordLoginFailure, clearLoginFailures,
 } = require('./auth');
 const { parseProcessingWorkbook } = require('./processingParser');
@@ -65,6 +66,41 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
 });
 
 /* ══════════════════════════════════
+   ROLE GATES
+
+   Registered before the route handlers so they apply to every method and
+   sub-path underneath, including ones added later. This is the authorization
+   boundary — the sidebar only decides what is convenient to show, so a route
+   that is not covered here is open to any signed-in account.
+
+   Managers own production and the commercial side; vets own animal health.
+   Neither can reach the other's data. Reads and writes are both gated for
+   these areas, because seeing the data is the thing being restricted.
+══════════════════════════════════ */
+
+/* Manager territory. */
+app.use('/api/sales',      verifyToken, requireProduction);
+app.use('/api/inventory',  verifyToken, requireProduction);
+app.use('/api/processing', verifyToken, requireProduction);
+app.use('/api/import',     verifyToken, requireProduction);
+
+/* Vet territory. */
+app.use('/api/diseases',       verifyToken, requireHealth);
+app.use('/api/treatments',     verifyToken, requireHealth);
+app.use('/api/pregnancies',    verifyToken, requireHealth);
+app.use('/api/health-records', verifyToken, requireHealth);
+app.use('/api/cow-history',    verifyToken, requireHealth);
+
+/* Shared reads, restricted writes. Every signed-in account can browse the
+   production record; only admins and managers may change it.
+   (/api/cows is deliberately not gated here — its writes are guarded on the
+   individual routes, because cow history underneath it belongs to the vet.) */
+app.use('/api/records', verifyToken, requireRoleForWrites('admin', 'manager'));
+
+/* Account management. */
+app.use('/api/users', verifyToken, requireAdmin);
+
+/* ══════════════════════════════════
    USER MANAGEMENT  (admin only)
 ══════════════════════════════════ */
 app.get('/api/users', verifyToken, requireAdmin, async (req, res) => {
@@ -79,12 +115,13 @@ app.get('/api/users', verifyToken, requireAdmin, async (req, res) => {
 });
 
 app.post('/api/users', verifyToken, requireAdmin, async (req, res) => {
-  /* The default has to be a single role, not the list of allowed ones —
-     defaulting to an array made the includes() check below reject every
-     request that omitted `role`. */
-  const { username, password, role = 'viewer' } = req.body;
+  /* Default to the most limited role, and validate against ROLES so this list
+     cannot drift from the database constraint the way it did with 'viewer'. */
+  const { username, password, role = 'veteran' } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (!['admin', 'viewer', 'manager', 'veteran'].includes(role)) return res.status(400).json({ error: 'Role not found' });
+  if (!ROLES.includes(role)) {
+    return res.status(400).json({ error: `Role must be one of: ${ROLES.join(', ')}` });
+  }
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
@@ -240,7 +277,10 @@ app.post('/api/records', verifyToken, async (req, res) => {
 });
 
 
-app.delete('/api/records/:id', verifyToken, requireAdmin, async (req, res) => {
+/* Managers own the production record, so they may correct it as well as add
+   to it. The /api/records prefix gate above already limits this to
+   admin and manager. */
+app.delete('/api/records/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM milk_records WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
@@ -439,7 +479,7 @@ app.get('/api/diseases', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/diseases', verifyToken, requireAdmin, async (req, res) => {
+app.post('/api/diseases', verifyToken, async (req, res) => {
   const { name, description, date, notes, cow_ids = [] } = req.body;
   if (!name || !date) return res.status(400).json({ error: 'name and date required' });
   const client = await pool.connect();
@@ -459,7 +499,7 @@ app.post('/api/diseases', verifyToken, requireAdmin, async (req, res) => {
   finally { client.release(); }
 });
 
-app.patch('/api/diseases/:id', verifyToken, requireAdmin, async (req, res) => {
+app.patch('/api/diseases/:id', verifyToken, async (req, res) => {
   const { name, description, date, notes, cow_ids } = req.body;
   const client = await pool.connect();
   try {
@@ -480,14 +520,14 @@ app.patch('/api/diseases/:id', verifyToken, requireAdmin, async (req, res) => {
   finally { client.release(); }
 });
 
-app.delete('/api/diseases/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/diseases/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM diseases WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/diseases/:id/treatments', verifyToken, requireAdmin, async (req, res) => {
+app.post('/api/diseases/:id/treatments', verifyToken, async (req, res) => {
   const { medicine_name, dosage, date, notes } = req.body;
   if (!medicine_name || !date) return res.status(400).json({ error: 'medicine_name and date required' });
   try {
@@ -499,7 +539,7 @@ app.post('/api/diseases/:id/treatments', verifyToken, requireAdmin, async (req, 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/treatments/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/treatments/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM treatments WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
@@ -520,7 +560,7 @@ app.get('/api/cows/:id/history', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/cows/:id/history', verifyToken, requireAdmin, async (req, res) => {
+app.post('/api/cows/:id/history', verifyToken, requireHealth, async (req, res) => {
   const { event_type, date, source, notes } = req.body;
   if (!event_type || !date) return res.status(400).json({ error: 'event_type and date required' });
   try {
@@ -532,7 +572,7 @@ app.post('/api/cows/:id/history', verifyToken, requireAdmin, async (req, res) =>
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/cow-history/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/cow-history/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM cow_history WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
@@ -558,7 +598,7 @@ app.get('/api/pregnancies', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/pregnancies', verifyToken, requireAdmin, async (req, res) => {
+app.post('/api/pregnancies', verifyToken, async (req, res) => {
   const { cow_id, conception_date, expected_due_date, notes } = req.body;
   if (!cow_id || !conception_date || !expected_due_date) return res.status(400).json({ error: 'cow_id, conception_date and expected_due_date required' });
   try {
@@ -571,7 +611,7 @@ app.post('/api/pregnancies', verifyToken, requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch('/api/pregnancies/:id', verifyToken, requireAdmin, async (req, res) => {
+app.patch('/api/pregnancies/:id', verifyToken, async (req, res) => {
   const { status, actual_birth_date, notes } = req.body;
   try {
     const { rows } = await pool.query(
@@ -586,7 +626,7 @@ app.patch('/api/pregnancies/:id', verifyToken, requireAdmin, async (req, res) =>
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/pregnancies/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/pregnancies/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM pregnancies WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
@@ -668,7 +708,7 @@ app.get('/api/alerts', verifyToken, async (req, res) => {
 /* ══════════════════════════════════
    PREGNANCY IMPORT FROM EXCEL
 ══════════════════════════════════ */
-app.post('/api/pregnancies/import', verifyToken, requireAdmin, upload.single('file'), async (req, res) => {
+app.post('/api/pregnancies/import', verifyToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
     const XLSX = require('xlsx');
@@ -858,7 +898,7 @@ app.post('/api/sales', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/sales/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/sales/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM sales WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
@@ -879,7 +919,7 @@ app.get('/api/sales/summary', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/sales/import', verifyToken, requireAdmin, upload.single('file'), async (req, res) => {
+app.post('/api/sales/import', verifyToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
     const wb    = XLSX.read(req.file.buffer, { type: 'buffer' });
@@ -922,7 +962,7 @@ app.get('/api/inventory/items', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/inventory/items', verifyToken, requireAdmin, async (req, res) => {
+app.post('/api/inventory/items', verifyToken, async (req, res) => {
   const { name, unit = 'pcs', notes } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
@@ -934,7 +974,7 @@ app.post('/api/inventory/items', verifyToken, requireAdmin, async (req, res) => 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch('/api/inventory/items/:id', verifyToken, requireAdmin, async (req, res) => {
+app.patch('/api/inventory/items/:id', verifyToken, async (req, res) => {
   const { name, unit, notes } = req.body;
   try {
     const { rows } = await pool.query(
@@ -945,7 +985,7 @@ app.patch('/api/inventory/items/:id', verifyToken, requireAdmin, async (req, res
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/inventory/items/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/inventory/items/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM inventory_items WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
@@ -981,7 +1021,7 @@ app.post('/api/inventory/logs', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/inventory/import', verifyToken, requireAdmin, upload.single('file'), async (req, res) => {
+app.post('/api/inventory/import', verifyToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
     const wb    = XLSX.read(req.file.buffer, { type: 'buffer' });
@@ -1041,7 +1081,7 @@ app.get('/api/diseases/:id/treatments', verifyToken, async (req, res) => {
 
 /* Nested delete for a cow history entry. The UI uses DELETE /api/cow-history/:id
    instead; this variant is kept for any caller that scopes by cow. */
-app.delete('/api/cows/:id/history/:hid', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/cows/:id/history/:hid', verifyToken, requireHealth, async (req, res) => {
   try {
     await pool.query('DELETE FROM cow_history WHERE id=$1 AND cow_id=$2', [req.params.hid, req.params.id]);
     res.json({ ok: true });
@@ -1339,7 +1379,7 @@ app.post('/api/processing/upload', verifyToken, upload.single('file'), async (re
 });
  
 /* Delete an upload */
-app.delete('/api/processing/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/processing/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM processing_uploads WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
@@ -1673,7 +1713,7 @@ app.post('/api/health-records/import', verifyToken, upload.single('file'), async
 });
  
 /* ── DELETE /api/health-records/:id */
-app.delete('/api/health-records/:id', verifyToken, requireAdmin, async (req, res) => {
+app.delete('/api/health-records/:id', verifyToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM cow_health_records WHERE id=$1', [req.params.id]);
     res.json({ ok: true });

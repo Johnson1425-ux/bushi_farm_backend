@@ -35,7 +35,7 @@ async function initDB() {
         id            SERIAL PRIMARY KEY,
         username      VARCHAR(50) NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
-        role          VARCHAR(10) NOT NULL DEFAULT 'viewer' CHECK (role IN ('admin', 'viewer', 'manager', 'veteran')),
+        role          VARCHAR(10) NOT NULL DEFAULT 'veteran' CHECK (role IN ('admin', 'manager', 'veteran')),
         created_at    TIMESTAMP DEFAULT NOW()
       );
 
@@ -138,13 +138,17 @@ async function initDB() {
        has to be applied explicitly here. Keep every statement idempotent so
        this block is safe to run on every boot. */
 
-    /* The role list grew to include 'manager' and 'veteran'. Databases created
-       before that change kept the original two-value constraint, which made
-       the Users page fail with users_role_check on those two roles. */
+    /* Roles are admin / manager / veteran. Two corrections are folded in here:
+       databases created before 'manager' and 'veteran' existed kept a
+       two-value constraint that rejected them, and 'viewer' has since been
+       retired. Any surviving viewer is moved to 'veteran', the most limited
+       remaining role, so the constraint below cannot fail on existing rows. */
     await client.query(`
       ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+      UPDATE users SET role = 'veteran' WHERE role = 'viewer';
       ALTER TABLE users ADD CONSTRAINT users_role_check
-        CHECK (role IN ('admin', 'viewer', 'manager', 'veteran'));
+        CHECK (role IN ('admin', 'manager', 'veteran'));
+      ALTER TABLE users ALTER COLUMN role SET DEFAULT 'veteran';
     `);
 
     /* Seed a default admin if no users exist yet */

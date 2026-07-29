@@ -33,10 +33,48 @@ function verifyToken(req, res, next) {
   }
 }
 
-function requireAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-  next();
+/* ══════════════════════════════════
+   ROLES
+
+   admin    — everything
+   manager  — production, sales, inventory, processing
+   veteran  — animal health: diseases, treatments, pregnancies, vet records
+
+   Managers and vets share read access to the herd and the farm overview, but
+   neither can see the other's area. Hiding a page in the sidebar is not a
+   permission, so every restricted route is gated here as well.
+══════════════════════════════════ */
+const ROLES = ['admin', 'manager', 'veteran'];
+
+/** Gate a route to specific roles. */
+function requireRole(...allowed) {
+  return (req, res, next) => {
+    if (!allowed.includes(req.user?.role)) {
+      return res.status(403).json({
+        error: `This action is limited to ${allowed.join(' and ')} accounts`,
+      });
+    }
+    next();
+  };
 }
+
+/**
+ * Let reads through for any signed-in user but gate writes to the given roles.
+ * Used as a path-prefix guard where GET is shared but POST/PATCH/DELETE is not.
+ */
+function requireRoleForWrites(...allowed) {
+  const gate = requireRole(...allowed);
+  return (req, res, next) =>
+    (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS')
+      ? next()
+      : gate(req, res, next);
+}
+
+const requireAdmin      = requireRole('admin');
+/** Production, sales, inventory and the processing unit. */
+const requireProduction = requireRole('admin', 'manager');
+/** Animal health: diseases, treatments, pregnancies, veterinary records. */
+const requireHealth     = requireRole('admin', 'veteran');
 
 /* ══════════════════════════════════
    LOGIN THROTTLING
@@ -92,6 +130,8 @@ function clearLoginFailures(req) {
 }
 
 module.exports = {
-  verifyToken, requireAdmin, SECRET,
+  verifyToken, SECRET, ROLES,
+  requireRole, requireRoleForWrites,
+  requireAdmin, requireProduction, requireHealth,
   loginRateLimit, recordLoginFailure, clearLoginFailures,
 };
