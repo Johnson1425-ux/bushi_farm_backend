@@ -16,6 +16,11 @@ const { pool } = require('./db');
 /* ── helpers ─────────────────────────────────────────────── */
 
 const num = (v) => (v === null || v === undefined ? null : Number(v));
+/* Same, but for arithmetic: a missing figure is zero, never NaN. */
+const num0 = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
 
 /** Clamp a user-supplied date to YYYY-MM-DD, or null. */
 function safeDate(v) {
@@ -333,18 +338,29 @@ async function inventoryContext({ from, to }) {
 /* ── processing unit ─────────────────────────────────────── */
 
 /**
- * Processing data is keyed by upload + day-of-month rather than a real date,
+ * Processing data is keyed by month + day-of-month rather than a real date,
  * so it cannot be filtered by the report period. We return the most recent
- * uploads instead and label them clearly so the model does not silently
+ * months instead and label them clearly so the model does not silently
  * present them as period-aligned.
+ *
+ * Alongside the raw figures each month carries a `reconciliation` block: how
+ * much of the milk taken in came back out as packed litres, what share was
+ * written off, and whether stock balances. Those are the questions anyone
+ * actually asks of a processing unit, and computing them here means every
+ * report and every chat answer works from the same arithmetic rather than
+ * each one re-deriving it from the tables — differently.
  */
 async function processingContext(limit = 2) {
   const { rows: uploads } = await pool.query(`
-    SELECT id, label, TO_CHAR(uploaded_at, 'YYYY-MM-DD') AS uploaded_at
-    FROM processing_uploads ORDER BY uploaded_at DESC LIMIT $1
+    SELECT id, label, month_num, year, source,
+           opening_fresh_litres, fresh_damage_litres,
+           TO_CHAR(uploaded_at, 'YYYY-MM-DD') AS uploaded_at
+    FROM processing_uploads
+    ORDER BY year DESC NULLS LAST, month_num DESC NULLS LAST, uploaded_at DESC
+    LIMIT $1
   `, [limit]);
 
-  if (!uploads.length) return { note: 'No processing unit data uploaded yet.', uploads: [] };
+  if (!uploads.length) return { note: 'No processing unit data uploaded yet.', months: [] };
 
   const ids = uploads.map(u => u.id);
 
@@ -360,34 +376,156 @@ async function processingContext(limit = 2) {
     pool.query(`
       SELECT upload_id,
              ROUND(SUM(farm_litres)::numeric, 1)      AS farm_litres,
-             ROUND(SUM(purchased_litres)::numeric, 1) AS purchased_litres
+             ROUND(SUM(mwabulugu_litres)::numeric, 1) AS mwabulugu_litres,
+             ROUND(SUM(purchased_litres)::numeric, 1) AS purchased_litres,
+             ROUND(SUM(damaged_litres)::numeric, 1)   AS damaged_litres,
+             COUNT(*)::int                            AS days_recorded
       FROM processing_milk_received WHERE upload_id = ANY($1) GROUP BY upload_id
     `, [ids]),
     agg('processing_packed'),
     agg('processing_issued'),
     agg('processing_damaged'),
     pool.query(`
-      SELECT upload_id, product, size, ROUND(SUM(units)::numeric, 1) AS units
+      SELECT upload_id, product, size,
+             opening_units, packed_units, issued_units, damaged_units,
+             units AS closing_units, litres AS closing_litres
       FROM processing_stock WHERE upload_id = ANY($1)
-      GROUP BY upload_id, product, size ORDER BY product, size
+      ORDER BY product, size
     `, [ids]),
   ]);
 
   const byUpload = (rows, id) => rows.filter(r => r.upload_id === id)
     .map(({ upload_id, ...rest }) => rest);
 
-  return {
-    note: 'Processing records are organised by monthly upload, not by calendar date, '
-        + 'so they may not align exactly with the report period.',
-    uploads: uploads.map(u => ({
+  const months = uploads.map((u) => {
+    const rec = byUpload(received.rows, u.id)[0] || null;
+    const p = byUpload(packed.rows, u.id);
+    const i = byUpload(issued.rows, u.id);
+    const d = byUpload(damaged.rows, u.id);
+    const s = byUpload(stock.rows, u.id);
+
+    const sum = (rows, key) => rows.reduce((a, r) => a + num0(r[key]), 0);
+    const receivedLitres = rec
+      ? num0(rec.farm_litres) + num0(rec.mwabulugu_litres) + num0(rec.purchased_litres)
+      : 0;
+    const packedLitres = sum(p, 'litres');
+    const packedUnits = sum(p, 'units');
+    const damagedUnits = sum(d, 'units');
+    const availableLitres = receivedLitres + num0(u.opening_fresh_litres);
+
+    const pct = (part, whole) => (whole > 0 ? Math.round((part / whole) * 1000) / 10 : null);
+
+    return {
       label: u.label,
+      month_num: u.month_num,
+      year: u.year,
+      /* 'legacy' means the figures came from the farm's own hand-kept
+         workbook rather than the app's template — worth knowing before
+         drawing a fine distinction from them. */
+      read_from: u.source,
       uploaded_at: u.uploaded_at,
-      milk_received: byUpload(received.rows, u.id)[0] || null,
-      packed:  byUpload(packed.rows,  u.id),
-      issued:  byUpload(issued.rows,  u.id),
-      damaged: byUpload(damaged.rows, u.id),
-      closing_stock: byUpload(stock.rows, u.id),
-    })),
+      milk_received: rec && {
+        ...rec,
+        total_litres: Math.round(receivedLitres * 10) / 10,
+        opening_fresh_litres: num0(u.opening_fresh_litres),
+      },
+      packed: p,
+      issued: i,
+      damaged: d,
+      stock: s,
+      reconciliation: {
+        milk_available_litres: Math.round(availableLitres * 10) / 10,
+        packed_litres: Math.round(packedLitres * 10) / 10,
+        /* Litres that went in but never came out as a sealed pack: spillage,
+           residue, and mis-keying all land here together, so treat a figure
+           in the low single-digit percentages as normal. */
+        unaccounted_litres: Math.round((availableLitres - packedLitres) * 10) / 10,
+        yield_pct: pct(packedLitres, availableLitres),
+        packed_units: packedUnits,
+        issued_units: sum(i, 'units'),
+        damaged_units: damagedUnits,
+        damage_rate_pct: pct(damagedUnits, packedUnits),
+        /* The month total, from the upload row. The per-day figures in
+           processing_milk_received.damaged_litres are the same litres broken
+           out by date — adding both would count the loss twice. */
+        fresh_milk_damaged_litres: num0(u.fresh_damage_litres),
+        closing_units: sum(s, 'closing_units'),
+        closing_litres: Math.round(sum(s, 'closing_litres') * 10) / 10,
+        /* Closing below zero is arithmetically impossible: it means the sheet
+           issued or wrote off more packs than were ever made. Naming the lines
+           keeps the model from reporting the negative total as real stock. */
+        negative_lines: s.filter(r => num0(r.closing_units) < 0)
+          .map(r => ({ product: r.product, size: r.size, closing_units: num0(r.closing_units) })),
+      },
+    };
+  });
+
+  return {
+    note: 'Processing records are organised by month, not by calendar date, so they may '
+        + 'not align exactly with the report period. Litres for packed, issued and damaged '
+        + 'goods are derived from the pack size, not typed in.',
+    months,
+    // Kept under the old key so anything still reading `uploads` keeps working.
+    uploads: months,
+  };
+}
+
+/**
+ * Everything recorded for one processing month, day by day.
+ *
+ * The aggregate view above answers "how did the month go"; this answers
+ * "what happened on the 14th", which is the form most follow-up questions
+ * take once something looks wrong.
+ */
+async function processingMonth(label) {
+  const { rows } = await pool.query(`
+    SELECT id, label, month_num, year, source,
+           opening_fresh_litres, fresh_damage_litres
+    FROM processing_uploads WHERE UPPER(label) = UPPER($1) LIMIT 1
+  `, [String(label || '').trim()]);
+
+  if (!rows.length) {
+    const { rows: available } = await pool.query(`
+      SELECT label FROM processing_uploads
+      ORDER BY year DESC NULLS LAST, month_num DESC NULLS LAST LIMIT 24
+    `);
+    return {
+      error: `No processing data for "${label}".`,
+      available_months: available.map(r => r.label),
+    };
+  }
+
+  const up = rows[0];
+  const daily = (table) => pool.query(`
+    SELECT day, product, size, units, litres FROM ${table}
+    WHERE upload_id = $1 AND units <> 0 ORDER BY day, product, size
+  `, [up.id]);
+
+  const [received, packed, issued, damaged, stock] = await Promise.all([
+    pool.query(`
+      SELECT day, farm_litres, mwabulugu_litres, purchased_litres, damaged_litres
+      FROM processing_milk_received WHERE upload_id = $1 ORDER BY day
+    `, [up.id]),
+    daily('processing_packed'),
+    daily('processing_issued'),
+    daily('processing_damaged'),
+    pool.query(`
+      SELECT product, size, opening_units, packed_units, issued_units,
+             damaged_units, units AS closing_units, litres AS closing_litres
+      FROM processing_stock WHERE upload_id = $1 ORDER BY product, size
+    `, [up.id]),
+  ]);
+
+  return {
+    label: up.label,
+    read_from: up.source,
+    opening_fresh_litres: num0(up.opening_fresh_litres),
+    fresh_damage_litres: num0(up.fresh_damage_litres),
+    daily_milk_received: received.rows,
+    daily_packed: packed.rows,
+    daily_issued: issued.rows,
+    daily_damaged: damaged.rows,
+    stock_by_product: stock.rows,
   };
 }
 
@@ -587,8 +725,58 @@ async function alertSignals() {
     `),
   ]);
 
+  /* Processing signals for the most recent month on file.
+
+     These are not date-filtered like the rest — the processing unit is
+     recorded a month at a time, so "recent" means the latest month uploaded.
+     A stale month is itself worth flagging, which is why days_since_upload
+     comes back rather than the row being dropped. */
+  const { rows: procRows } = await pool.query(`
+    WITH latest AS (
+      SELECT id, label, uploaded_at, fresh_damage_litres
+      FROM processing_uploads
+      ORDER BY year DESC NULLS LAST, month_num DESC NULLS LAST, uploaded_at DESC
+      LIMIT 1
+    )
+    SELECT l.label,
+           (CURRENT_DATE - l.uploaded_at::date)::int AS days_since_upload,
+           ROUND(l.fresh_damage_litres::numeric, 1)  AS fresh_damage_litres,
+           (SELECT COALESCE(SUM(units), 0) FROM processing_packed  WHERE upload_id = l.id) AS packed_units,
+           (SELECT COALESCE(SUM(units), 0) FROM processing_damaged WHERE upload_id = l.id) AS damaged_units,
+           (SELECT COALESCE(SUM(litres), 0) FROM processing_packed WHERE upload_id = l.id) AS packed_litres,
+           (SELECT COALESCE(SUM(farm_litres + mwabulugu_litres + purchased_litres), 0)
+              FROM processing_milk_received WHERE upload_id = l.id) AS received_litres,
+           (SELECT COALESCE(JSON_AGG(JSON_BUILD_OBJECT(
+                     'product', product, 'size', size, 'closing_units', units)), '[]')
+              FROM processing_stock WHERE upload_id = l.id AND units < 0) AS negative_stock
+    FROM latest l
+  `);
+
+  const proc = procRows[0] ? (() => {
+    const r = procRows[0];
+    const packedUnits = num0(r.packed_units);
+    const damagedUnits = num0(r.damaged_units);
+    const receivedLitres = num0(r.received_litres);
+    return {
+      month: r.label,
+      days_since_upload: r.days_since_upload,
+      packed_units: packedUnits,
+      damaged_units: damagedUnits,
+      damage_rate_pct: packedUnits > 0
+        ? Math.round((damagedUnits / packedUnits) * 1000) / 10 : null,
+      received_litres: Math.round(receivedLitres * 10) / 10,
+      packed_litres: Math.round(num0(r.packed_litres) * 10) / 10,
+      yield_pct: receivedLitres > 0
+        ? Math.round((num0(r.packed_litres) / receivedLitres) * 1000) / 10 : null,
+      fresh_milk_damaged_litres: num0(r.fresh_damage_litres),
+      // Impossible balances: more issued or written off than ever produced.
+      negative_stock_lines: r.negative_stock,
+    };
+  })() : null;
+
   return {
     as_of: new Date().toISOString().slice(0, 10),
+    processing_unit: proc,
     production_drops: drops.rows.map(r => ({
       name: r.name,
       avg_all: num(r.avg_all),
@@ -632,6 +820,7 @@ module.exports = {
   salesContext,
   inventoryContext,
   processingContext,
+  processingMonth,
   herdContext,
   cowDossier,
   alertSignals,

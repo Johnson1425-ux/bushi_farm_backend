@@ -188,8 +188,11 @@ period. Note any gap between litres produced and litres sold. Call out items
 that are out of stock or being consumed quickly.
 
 ## Processing unit
-Milk received, packed, issued, damaged, and closing stock. Skip this section
-entirely if there is no processing data.
+Milk received, packed, issued, damaged, and closing stock, using the
+reconciliation figures rather than re-deriving them. Give the yield and the
+damage rate. If a stock line closes below zero, say so — it is a counting error
+in the source sheet, not stock. Skip this section entirely if there is no
+processing data.
 
 ## What to do next
 Between three and six specific actions, as a bullet list. Each one names the
@@ -240,6 +243,112 @@ router.post('/reports/period', verifyToken, requireAi, async (req, res) => {
 });
 
 /* ══════════════════════════════════
+   PROCESSING UNIT REPORT
+
+   The whole-farm report gives the processing unit one section among seven,
+   which is enough to say what happened and not enough to say why. This one
+   does the reconciliation properly: milk in against packs out, what the
+   write-offs cost, and whether the stock balance can be believed.
+══════════════════════════════════ */
+
+const PROCESSING_SYSTEM = `
+Write a report on the milk processing unit for one month, in GitHub-flavoured
+Markdown. Use these level-2 headings, in this order, and no others:
+
+## Headline
+Two or three sentences: how the month went and the one thing worth acting on.
+
+## Milk in, packs out
+Litres taken in (farm, Mwabulugu, purchased, plus anything carried in) against
+litres packed, and the yield that implies. Say which products absorbed the milk.
+The gap between milk available and litres packed is spillage, residue and
+keying error together — a few percent is ordinary, so only call it out when it
+is not.
+
+## Damage
+Packs written off and raw milk spoiled before packing, as figures and as a share
+of what was made. Name the products carrying the losses. Say plainly if damage
+is concentrated in one line rather than spread across the range.
+
+## Stock
+Opening balance, what was produced, what was issued, and what should be left,
+per product where it matters. If any line closes negative, lead with that: it
+means more was issued or written off than ever existed, so it is a counting
+mistake in the sheet, not stock. Name those lines and say what to check.
+
+## What to do next
+Between three and six specific actions as a bullet list, each naming the product,
+figure, or day that prompted it. No generic advice about dairy hygiene.
+
+Two things to hold on to:
+- Litres for packed, issued and damaged goods are derived from the pack size,
+  not typed in, so they cannot disagree with the unit counts. Do not present
+  them as an independent measurement.
+- When a month was read from the farm's own hand-kept workbook (read_from is
+  "legacy"), the figures carry whatever inconsistencies that sheet had. Say so
+  once if you rely on a number that looks wrong, rather than reasoning around it.
+`.trim();
+
+router.post('/reports/processing', verifyToken, requireAi, async (req, res) => {
+  const requested = typeof req.body?.month === 'string' ? req.body.month.trim() : '';
+
+  let processing;
+  try {
+    /* No month given means the most recent one, which is what someone
+       clicking "generate" from the page they are already looking at wants. */
+    if (requested) {
+      processing = await ctx.processingMonth(requested);
+      if (processing.error) return res.status(404).json(processing);
+    } else {
+      const recent = await ctx.processingContext(1);
+      if (!recent.months?.length) {
+        return res.status(404).json({ error: 'No processing unit data has been uploaded yet.' });
+      }
+      processing = await ctx.processingMonth(recent.months[0].label);
+    }
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+
+  // The aggregate view carries the reconciliation arithmetic; the detail view
+  // carries the daily rows. The report needs both.
+  const summary = await ctx.processingContext(6);
+  const thisMonth = summary.months.find(m => m.label === processing.label) || null;
+  const previous = summary.months.filter(m => m.label !== processing.label).slice(0, 1);
+
+  const user = [
+    `Processing month: ${processing.label}.`,
+    previous.length ? `The month before it, for comparison, is ${previous[0].label}.` : '',
+    '\nReconciliation for this month:\n',
+    '```json', JSON.stringify(thisMonth, null, 1), '```',
+    '\nDaily detail:\n',
+    '```json', JSON.stringify(processing, null, 1), '```',
+    previous.length ? '\nPrevious month, for comparison:\n' : '',
+    previous.length ? '```json' : '',
+    previous.length ? JSON.stringify(previous[0], null, 1) : '',
+    previous.length ? '```' : '',
+  ].filter(Boolean).join('\n');
+
+  await streamAndSave(req, res, {
+    system: PROCESSING_SYSTEM,
+    user,
+    maxTokens: 12000,
+    effort: 'high',
+    save: (result) => ai.saveReport({
+      kind: 'processing',
+      title: `Processing unit — ${processing.label}`,
+      content: result.text,
+      params: { month: processing.label },
+      model: result.model,
+      usage: result.usage,
+      periodFrom: null,
+      periodTo: null,
+      userId: req.user.id,
+    }),
+  });
+});
+
+/* ══════════════════════════════════
    DAILY BRIEFING
 ══════════════════════════════════ */
 
@@ -258,6 +367,10 @@ Rules:
   cows dropping output at once is one observation, not five.
 - A cow with no recent milk record is usually a missed data entry, not a sick
   animal. Say so, and do not escalate it into a health warning.
+- The processing signals cover the most recent month uploaded, not today. Raise
+  them only when something is actually wrong — a stock line closing below zero,
+  damage well above its usual share, or a month that has gone unrecorded for
+  weeks. A month sitting there with ordinary figures is not an action item.
 - If nothing genuinely needs attention, say that in one line and stop. Do not
   manufacture items to fill the section.
 - Keep the whole briefing under 300 words. It is read standing up.
@@ -473,6 +586,26 @@ const CHAT_TOOLS = [
     },
   },
   {
+    name: 'get_processing_month',
+    description:
+      'One month of processing-unit records in full detail: milk taken in each day, packs '
+      + 'made, issued and written off each day by product and size, and the stock balance '
+      + 'per line. Call this when a question is about the processing unit specifically — '
+      + 'which day something happened, which product is short, how a balance was arrived '
+      + 'at. Use get_farm_data instead for month totals across several months.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        month: {
+          type: 'string',
+          description: 'The month label, like "JUNE 2026". If you do not know which months '
+            + 'exist, pass any value — the reply lists the available ones.',
+        },
+      },
+      required: ['month'],
+    },
+  },
+  {
     name: 'get_alerts',
     description:
       'Current warning signals: cows whose recent yield is more than 20 percent below '
@@ -504,6 +637,9 @@ async function runChatTool(name, input) {
 
     case 'get_alerts':
       return ctx.alertSignals();
+
+    case 'get_processing_month':
+      return ctx.processingMonth(input?.month);
 
     case 'get_cow_dossier': {
       const cow = await findCow(input?.cow_name);
