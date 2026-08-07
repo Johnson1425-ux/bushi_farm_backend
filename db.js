@@ -136,55 +136,103 @@ async function initDB() {
        CREATE TABLE IF NOT EXISTS does nothing to a table that already
        exists, so any schema change made after a database was first created
        has to be applied explicitly here. Keep every statement idempotent so
-       this block is safe to run on every boot. */
+       this block is safe to run on every boot.
 
-    /* Roles are admin / manager / veteran. Two corrections are folded in here:
-       databases created before 'manager' and 'veteran' existed kept a
-       two-value constraint that rejected them, and 'viewer' has since been
-       retired. Any surviving viewer is moved to 'veteran', the most limited
-       remaining role, so the constraint below cannot fail on existing rows. */
-    await client.query(`
-      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
-      UPDATE users SET role = 'veteran' WHERE role = 'viewer';
-      ALTER TABLE users ADD CONSTRAINT users_role_check
-        CHECK (role IN ('admin', 'manager', 'veteran'));
-      ALTER TABLE users ALTER COLUMN role SET DEFAULT 'veteran';
-    `);
+       Each step runs on its own. Passing several statements to one query()
+       puts them in an implicit transaction, so one failure rolls back the
+       whole batch — and because the steps used to run in sequence with no
+       error handling, a failure in an early one meant every later migration
+       was skipped entirely. That is how a single out-of-range users.role
+       value left processing_uploads without the columns the upload route
+       needs, reported to the operator as nothing more than
+       'column "month_num" does not exist' at upload time.
 
-    /* Processing unit: figures the original tables had nowhere to put.
+       A step that fails now leaves the rest to apply, and says so loudly. */
+    const migrations = [
+      /* Roles are admin / manager / veteran. Databases created before
+         'manager' and 'veteran' existed kept a two-value constraint that
+         rejected them, and 'viewer' has since been retired.
 
-       The farm's own workbook carries a stock balance forward from one month
-       to the next, splits milk received across three sources rather than two,
-       and records raw milk spoiled before packing separately from packs
-       written off after it. Without these columns an upload silently lost all
-       of that, and closing stock could only ever be guessed at. */
-    await client.query(`
-      ALTER TABLE processing_uploads
-        ADD COLUMN IF NOT EXISTS opening_fresh_litres NUMERIC NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS fresh_damage_litres  NUMERIC NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS month_num            INTEGER,
-        ADD COLUMN IF NOT EXISTS year                 INTEGER,
-        ADD COLUMN IF NOT EXISTS source               TEXT;
+         Anything outside the current three is moved to 'veteran', the most
+         limited role, rather than only 'viewer' — a database carrying some
+         other historical value would otherwise fail the CHECK below, and
+         narrowing an unknown role to the least privileged one is the safe
+         direction to be wrong in. */
+      ['users.role constraint', `
+        ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+        UPDATE users SET role = 'veteran'
+          WHERE role IS NULL OR role NOT IN ('admin', 'manager', 'veteran');
+        ALTER TABLE users ADD CONSTRAINT users_role_check
+          CHECK (role IN ('admin', 'manager', 'veteran'));
+        ALTER TABLE users ALTER COLUMN role SET DEFAULT 'veteran';
+      `],
 
-      ALTER TABLE processing_milk_received
-        ADD COLUMN IF NOT EXISTS mwabulugu_litres NUMERIC NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS damaged_litres   NUMERIC NOT NULL DEFAULT 0;
+      /* Processing unit: figures the original tables had nowhere to put.
+
+         The farm's own workbook carries a stock balance forward from one
+         month to the next, splits milk received across three sources rather
+         than two, and records raw milk spoiled before packing separately
+         from packs written off after it. Without these columns an upload
+         silently lost all of that, and closing stock could only ever be
+         guessed at. */
+      ['processing_uploads columns', `
+        ALTER TABLE processing_uploads
+          ADD COLUMN IF NOT EXISTS opening_fresh_litres NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS fresh_damage_litres  NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS month_num            INTEGER,
+          ADD COLUMN IF NOT EXISTS year                 INTEGER,
+          ADD COLUMN IF NOT EXISTS source               TEXT;
+      `],
+
+      ['processing_milk_received columns', `
+        ALTER TABLE processing_milk_received
+          ADD COLUMN IF NOT EXISTS mwabulugu_litres NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS damaged_litres   NUMERIC NOT NULL DEFAULT 0;
+      `],
 
       /* processing_stock.units is the CLOSING balance. The movements that
          produce it are stored alongside so the figure can be explained
          without re-reading the daily tables. */
-      ALTER TABLE processing_stock
-        ADD COLUMN IF NOT EXISTS opening_units NUMERIC NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS packed_units  NUMERIC NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS issued_units  NUMERIC NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS damaged_units NUMERIC NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS litres        NUMERIC NOT NULL DEFAULT 0;
+      ['processing_stock columns', `
+        ALTER TABLE processing_stock
+          ADD COLUMN IF NOT EXISTS opening_units NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS packed_units  NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS issued_units  NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS damaged_units NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS litres        NUMERIC NOT NULL DEFAULT 0;
+      `],
 
       /* One upload per month, enforced rather than assumed: the upload route
          replaces a month by label, and a duplicate row would leave the old
-         figures visible beside the new ones. */
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_proc_uploads_label ON processing_uploads(label);
-    `);
+         figures visible beside the new ones. Older rows are de-duplicated
+         first, keeping the most recent, or the index cannot be built.
+
+         This one is deliberately last: it is the only step that can fail on
+         data rather than on schema, and nothing else depends on it. */
+      ['unique month index', `
+        DELETE FROM processing_uploads a
+          USING processing_uploads b
+          WHERE a.label = b.label AND a.id < b.id;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_proc_uploads_label
+          ON processing_uploads(label);
+      `],
+    ];
+
+    const failures = [];
+    for (const [name, sql] of migrations) {
+      try {
+        await client.query(sql);
+      } catch (err) {
+        failures.push({ name, message: err.message });
+        console.error(`✗ Migration "${name}" failed: ${err.message}`);
+      }
+    }
+    if (failures.length) {
+      console.error(
+        `✗ ${failures.length} of ${migrations.length} migrations did not apply. `
+        + 'The API is running against an incomplete schema and some routes will fail.'
+      );
+    }
 
     /* Seed a default admin if no users exist yet */
     const { rows } = await client.query('SELECT COUNT(*) FROM users');
@@ -205,4 +253,30 @@ async function initDB() {
   }
 }
 
-module.exports = { pool, initDB };
+/* ── startup gate ────────────────────────────────────────────────
+   initDB() used to be fired and forgotten at module load. Requests were
+   served immediately, so anything arriving during a cold start could reach
+   a table whose migration had not run yet and fail on a missing column —
+   and on a serverless host, where the process can be frozen once a response
+   is sent, a migration interrupted that way may never finish at all.
+
+   `ready()` runs the initialisation exactly once per process and hands back
+   the same promise to every caller, so a request can wait for it instead of
+   racing it. A failure is not cached as permanent: the next call retries,
+   since the usual cause is the database still coming up. */
+let _ready = null;
+
+function ready(...tasks) {
+  if (!_ready) {
+    _ready = (async () => {
+      await initDB();
+      for (const task of tasks) await task();
+    })().catch((err) => {
+      _ready = null;
+      throw err;
+    });
+  }
+  return _ready;
+}
+
+module.exports = { pool, initDB, ready };

@@ -7,7 +7,7 @@ const bcrypt   = require('bcrypt');
 const jwt      = require('jsonwebtoken');
 const path     = require('path');
 const mammoth   = require('mammoth');
-const { pool, initDB }           = require('./db');
+const { pool, ready }            = require('./db');
 const {
   verifyToken, SECRET, ROLES,
   requireAdmin, requireProduction, requireHealth, requireRoleForWrites,
@@ -41,6 +41,34 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
+
+/* Start the schema work now, so a warm process has it done already. */
+ready(initAiTables).catch(err => console.error('DB Init Error:', err.message));
+
+/* Nothing is served until the schema is in place.
+
+   Migrations begin at module load, but on a serverless host the first
+   request can arrive while they are still running — which surfaces as a
+   route failing on a column that is about to exist. ready() hands every
+   caller the same promise, so this waits on the work already in flight
+   rather than repeating it, and costs nothing once it has resolved.
+
+   Calling ready() per request rather than awaiting a promise captured at
+   load time also means a failed start is retried: the usual cause is the
+   database still coming up, and a process that gave up once would
+   otherwise serve 503s until it was redeployed. */
+app.use(async (req, res, next) => {
+  try {
+    await ready(initAiTables);
+    next();
+  } catch (err) {
+    console.error('DB Init Error:', err.message);
+    res.status(503).json({
+      error: 'The database is not ready yet. Try again in a moment.',
+      detail: err.message,
+    });
+  }
+});
 
 /* ══════════════════════════════════
    AUTH ROUTES  (public)
@@ -1814,10 +1842,8 @@ app.use('/api/ai', aiRoutes);
    START (Updated for Vercel)
 ══════════════════════════════════ */
 
-// 1. Initialize the DB immediately (top level)
-initDB()
-  .then(initAiTables)
-  .catch(err => console.error('DB Init Error:', err.message));
+// 1. Schema setup is kicked off above, next to the middleware that waits on
+//    it, so the two cannot drift apart.
 
 // 2. EXPORT the app (Mandatory for Vercel)
 module.exports = app;
