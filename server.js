@@ -293,25 +293,75 @@ app.delete('/api/records/:id', verifyToken, async (req, res) => {
 /* ══════════════════════════════════
    BULK IMPORT  (admin only)
 ══════════════════════════════════ */
+/**
+ * Find the daily-readings grid in a workbook.
+ *
+ * The sheet is chosen by shape — a header row carrying both a cow column and
+ * numbered day columns — rather than by position or by name. Position fails
+ * because the production workbooks put a month-by-month summary in front of
+ * the daily grid; that summary has a "NAME OF COW" column too, so it looks
+ * like the right sheet until you notice its columns are month names. Name
+ * matching fails because the names are not stable: the same workbook family
+ * has "DAIRY PRODUCTION" one month and "DAILY PRODUCTION" the next, with the
+ * summary tab spelled "MONTHLY" or "MONTHRRY".
+ *
+ * Returns the winning sheet plus a note on every sheet examined, so a failure
+ * can say what was actually found instead of blaming the file.
+ */
+function findDailyGrid(wb) {
+  const examined = [];
+
+  for (const name of wb.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1 });
+
+    // The header can sit below title rows, so scan for it rather than
+    // assuming row 1 — but only consider a row that has day columns on it,
+    // otherwise the summary sheet's "NAME OF COW" row wins and the real
+    // grid further down the workbook is never reached.
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i] || [];
+      const cowColIndex = row.findIndex(c => String(c).toUpperCase().includes('COW'));
+      if (cowColIndex === -1) continue;
+
+      const dayColumns = [];
+      row.forEach((col, idx) => {
+        const day = parseInt(col, 10);
+        if (!isNaN(day) && day >= 1 && day <= 31) dayColumns.push({ day, idx });
+      });
+
+      if (dayColumns.length) {
+        return { sheetName: name, rows, headerIndex: i, cowColIndex, dayColumns, examined };
+      }
+      examined.push({ sheet: name, found: 'a cow column but no day columns' });
+      break;
+    }
+    if (!examined.some(e => e.sheet === name)) {
+      examined.push({ sheet: name, found: 'no cow column' });
+    }
+  }
+
+  return { sheetName: null, examined };
+}
+
 app.post('/api/import', verifyToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
-    const wb   = XLSX.read(req.file.buffer, { type: 'buffer' });
-    const sheet = wb.Sheets[wb.SheetNames[0]];
-    const rows  = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-    if (!rows.length) return res.status(400).json({ error: 'Empty file' });
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    if (!wb.SheetNames.length) return res.status(400).json({ error: 'Empty file' });
 
-    const headerIndex = rows.findIndex(r => r.some(cell => String(cell).toUpperCase().includes('COW')));
-    if (headerIndex === -1) return res.status(400).json({ error: 'Invalid format: "COW" column not found' });
+    const grid = findDailyGrid(wb);
+    if (!grid.sheetName) {
+      /* Name the sheets and say what each one was missing. "No day columns
+         found" on its own sends people looking for a fault in a file that is
+         usually fine — the readings were just on a sheet further along. */
+      return res.status(400).json({
+        error: 'No sheet in this workbook has a daily readings grid '
+             + '(a cow column plus columns numbered 1–31).',
+        sheets_checked: grid.examined,
+      });
+    }
 
-    const header      = rows[headerIndex];
-    const cowColIndex = header.findIndex(c => String(c).toUpperCase().includes('COW'));
-    const dayColumns  = [];
-    header.forEach((col, idx) => {
-      const day = parseInt(col);
-      if (!isNaN(day) && day >= 1 && day <= 31) dayColumns.push({ day, idx });
-    });
-    if (!dayColumns.length) return res.status(400).json({ error: 'No day columns (1–31) found' });
+    const { rows, headerIndex, cowColIndex, dayColumns } = grid;
 
     let year = new Date().getFullYear(), month = new Date().getMonth() + 1;
     const name = req.file.originalname.toLowerCase();
@@ -335,11 +385,17 @@ app.post('/api/import', verifyToken, upload.single('file'), async (req, res) => 
 
     const client = await pool.connect();
     let added = 0, skipped = 0;
+    const cowsSeen = new Set();
     try {
       await client.query('BEGIN');
       for (const row of rows.slice(headerIndex + 1)) {
         const cowName = String(row[cowColIndex] || '').trim();
         if (!cowName) continue;
+        /* The grid ends in totals and averages rows that have no cow name of
+           their own but do carry figures. Anything below the last named row
+           is footer, not another animal. */
+        if (/^(TOTAL|AVERAGE|AVG|GRAND TOTAL|SUM)\b/i.test(cowName)) continue;
+        cowsSeen.add(cowName);
         const cowRes = await client.query(
           `INSERT INTO cows(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
           [cowName]
@@ -365,7 +421,15 @@ app.post('/api/import', verifyToken, upload.single('file'), async (req, res) => 
     } finally {
       client.release();
     }
-    res.json({ success: true, added, skipped, detected_month: month, detected_year: year });
+    /* The sheet comes back with the result: when a workbook holds several
+       candidates, knowing which one was read is the difference between
+       trusting the import and re-checking it by hand. */
+    res.json({
+      success: true, added, skipped,
+      detected_month: month, detected_year: year,
+      sheet: grid.sheetName,
+      cows: cowsSeen.size,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
