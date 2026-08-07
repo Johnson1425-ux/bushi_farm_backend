@@ -14,6 +14,7 @@ const {
   loginRateLimit, recordLoginFailure, clearLoginFailures,
 } = require('./auth');
 const { parseProcessingWorkbook } = require('./processingParser');
+const { buildProcessingTemplate } = require('./processingTemplate');
 const aiRoutes                    = require('./aiRoutes');
 const { initAiTables }            = require('./aiClient');
 
@@ -1171,101 +1172,125 @@ app.get('/api/alerts/daily', verifyToken, async (req, res) => {
 });
 
 /* ══════════════════════════════════
-   GET  /api/processing               — list all uploads
-   GET  /api/processing/:id           — full data for one upload
-   POST /api/processing/upload        — parse & save a new xlsx (admin)
-   DELETE /api/processing/:id         — delete an upload (admin)
+   PROCESSING UNIT
+
+   GET    /api/processing            — list all uploads
+   GET    /api/processing/template   — download the blank workbook
+   GET    /api/processing/:id        — full data for one upload
+   POST   /api/processing/upload     — parse & save a workbook
+   DELETE /api/processing/:id        — delete an upload
 ══════════════════════════════════ */
- 
-/* List all uploads */
+
+/* List all uploads, newest month first.
+
+   Ordering is by the month the figures belong to, not by when the file was
+   uploaded — a month keyed in late would otherwise jump to the top of the
+   list. Rows imported before month_num existed fall back to upload time. */
 app.get('/api/processing', verifyToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT u.id, u.label, u.uploaded_at, usr.username AS uploaded_by
+      SELECT u.id, u.label, u.uploaded_at, u.month_num, u.year, u.source,
+             usr.username AS uploaded_by
       FROM processing_uploads u
       LEFT JOIN users usr ON usr.id = u.uploaded_by
-      ORDER BY u.uploaded_at DESC
+      ORDER BY u.year DESC NULLS LAST, u.month_num DESC NULLS LAST, u.uploaded_at DESC
     `);
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
- 
-/* Full data for one upload — returns summary + daily arrays */
+
+/* Download the blank workbook.
+
+   Generated on demand from the same catalogue the parser validates against,
+   so the sheet someone types into can never expect different products from
+   the sheet the app reads back. Registered before the /:id route below,
+   which would otherwise swallow "template" as an id. */
+app.get('/api/processing/template', verifyToken, async (req, res) => {
+  try {
+    const months = typeof req.query.months === 'string' && req.query.months.trim()
+      ? req.query.months.split(',').map(s => s.trim()).filter(Boolean)
+      : undefined;
+    const year = req.query.year ? parseInt(req.query.year, 10) : undefined;
+
+    const buffer = await buildProcessingTemplate({ months, year });
+    const name = `MilkTrack_Processing_${year || new Date().getUTCFullYear()}.xlsx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+    res.send(buffer);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+/* Full data for one upload — daily arrays plus the stock reconciliation. */
 app.get('/api/processing/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
   try {
     const uploadRes = await pool.query(
-      `SELECT u.id, u.label, u.uploaded_at, usr.username AS uploaded_by
+      `SELECT u.id, u.label, u.uploaded_at, u.month_num, u.year, u.source,
+              u.opening_fresh_litres, u.fresh_damage_litres,
+              usr.username AS uploaded_by
        FROM processing_uploads u LEFT JOIN users usr ON usr.id = u.uploaded_by
        WHERE u.id=$1`,
       [id]
     );
     if (!uploadRes.rows.length) return res.status(404).json({ error: 'Not found' });
- 
-    const [received, packed, issued, stock] = await Promise.all([
+
+    const daily = (table) => pool.query(
+      `SELECT day, product, size, units, litres FROM ${table}
+       WHERE upload_id=$1 ORDER BY product, size, day`, [id]
+    );
+
+    const [received, packed, issued, damaged, stock] = await Promise.all([
       pool.query(
-        `SELECT day, farm_litres, purchased_litres FROM processing_milk_received
-         WHERE upload_id=$1 ORDER BY day`, [id]
+        `SELECT day, farm_litres, mwabulugu_litres, purchased_litres, damaged_litres
+         FROM processing_milk_received WHERE upload_id=$1 ORDER BY day`, [id]
       ),
+      daily('processing_packed'),
+      daily('processing_issued'),
+      daily('processing_damaged'),
       pool.query(
-        `SELECT day, product, size, units, litres FROM processing_packed
-         WHERE upload_id=$1 ORDER BY product, size, day`, [id]
-      ),
-      pool.query(
-        `SELECT day, product, size, units, litres FROM processing_issued
-         WHERE upload_id=$1 ORDER BY product, size, day`, [id]
-      ),
-      pool.query(
-        `SELECT product, size, units FROM processing_stock
-         WHERE upload_id=$1 ORDER BY product, size`, [id]
+        `SELECT product, size, opening_units, packed_units, issued_units,
+                damaged_units, units, litres
+         FROM processing_stock WHERE upload_id=$1 ORDER BY product, size`, [id]
       ),
     ]);
- 
+
     res.json({
       upload:   uploadRes.rows[0],
       received: received.rows,
       packed:   packed.rows,
       issued:   issued.rows,
+      damaged:  damaged.rows,
       stock:    stock.rows,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
- 
-/* Upload & parse a new processing workbook (xlsx)
 
-   Uses the structured template parser (processingParser.js). The workbook
-   holds one sheet per month; each month sheet stacks the four sections
-   (RECEIVED, PROCESSED, PACKED, ISSUED). Records are located by fixed
-   anchors, so nothing is silently dropped — a layout problem returns a 422
-   listing exactly what is wrong instead of importing partial data.
+/* Upload & parse a processing workbook (xlsx).
 
-   Re-uploading a month REPLACES that month's existing records (clean
-   per-month overwrite), so an updated workbook can be re-submitted safely.  */
+   Two layouts are accepted: the template this app hands out, and the farm's
+   own BUSH_PROCESSING_UNIT workbook. See processingParser.js for how each is
+   recognised.
+
+   A structural problem returns 422 with the specific list of what is wrong
+   rather than importing part of the file. Warnings — a missing pack size, an
+   unlabelled cell, a product that closes negative — do not block the import;
+   they come back with the result so the operator can check them against the
+   original sheet.
+
+   Re-uploading a month REPLACES that month, so a corrected workbook can be
+   sent again without creating a second copy. */
 app.post('/api/processing/upload', verifyToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  // Parse the whole workbook by structure. Blank cells are ignored; any
-  // altered label, missing row, or bad value is collected as an error.
   const parsed = parseProcessingWorkbook(req.file.buffer);
 
-  // Hard stop on structural problems — do not import partial/ambiguous data.
   if (!parsed.ok) {
     return res.status(422).json({
       error:  'The workbook could not be imported. Fix the issues below and re-upload.',
       issues: parsed.errors,
+      warnings: parsed.warnings,
     });
-  }
-  if (!parsed.records.length) {
-    return res.status(400).json({ error: 'No data found in the workbook.' });
-  }
-
-  // Group the flat record stream by month (label = "JUNE 2026").
-  // Each record: { month, monthNum, year, section, group, category, day, quantity }
-  const byMonth = new Map();
-  for (const r of parsed.records) {
-    const label = `${r.month} ${r.year}`;
-    if (!byMonth.has(label)) byMonth.set(label, []);
-    byMonth.get(label).push(r);
   }
 
   const client  = await pool.connect();
@@ -1274,91 +1299,84 @@ app.post('/api/processing/upload', verifyToken, upload.single('file'), async (re
   try {
     await client.query('BEGIN');
 
-    for (const [label, records] of byMonth) {
-      // ── Replace: wipe any existing upload(s) for this month first. ──
-      // ON DELETE CASCADE on the child tables clears their rows too.
-      await client.query('DELETE FROM processing_uploads WHERE label=$1', [label]);
+    for (const m of parsed.months) {
+      // Replace the month wholesale; ON DELETE CASCADE clears the child rows.
+      await client.query('DELETE FROM processing_uploads WHERE label=$1', [m.label]);
 
-      // Fresh upload row for the month.
       const upRes = await client.query(
-        'INSERT INTO processing_uploads(label, uploaded_by) VALUES($1,$2) RETURNING id',
-        [label, req.user.id]
+        `INSERT INTO processing_uploads
+           (label, uploaded_by, month_num, year, source, opening_fresh_litres, fresh_damage_litres)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        [m.label, req.user.id, m.monthNum, m.year, m.source, m.openingFreshLitres, m.freshDamageLitres]
       );
       const uploadId = upRes.rows[0].id;
 
-      // ── Bucket this month's records by section. ──
-      // RECEIVED  -> processing_milk_received (farm_litres, purchased_litres)
-      // PROCESSED -> processing_packed        (units)   [what was made]
-      // ISSUED    -> processing_issued        (units)   [what went out]
-      // PACKED    -> processing_stock         (units)   [current packed stock]
-      const receivedByDay = {};                 // day -> { farm, purchased }
-      const packed = [], issued = [], stockByKey = {};
+      /* ── milk received: one row per day, sources across the columns ── */
+      const byDay = new Map();
+      const dayRow = (day) => {
+        if (!byDay.has(day)) byDay.set(day, { farm: 0, mwabulugu: 0, purchased: 0, damaged: 0 });
+        return byDay.get(day);
+      };
+      for (const r of m.received) {
+        const row = dayRow(r.day);
+        if (r.source === 'PURCHASED')           row.purchased += r.litres;
+        else if (r.source === 'FARM MWABULUGU') row.mwabulugu += r.litres;
+        else                                    row.farm      += r.litres;
+      }
+      /* Fresh milk written off is dated when the sheet dates it; the legacy
+         workbook gives only a monthly figure, which lands on day 1. These
+         daily rows are a breakdown of processing_uploads.fresh_damage_litres,
+         not a second loss — read one or the other, never their sum. */
+      for (const d of m.freshDamage) dayRow(d.day || 1).damaged += d.litres;
 
-      for (const r of records) {
-        if (r.section === 'RECEIVED') {
-          if (!receivedByDay[r.day]) receivedByDay[r.day] = { farm: 0, purchased: 0 };
-          // Template splits farm into two sources; the table has one column.
-          if (r.category === 'PURCHASED') receivedByDay[r.day].purchased += r.quantity;
-          else                            receivedByDay[r.day].farm      += r.quantity;
+      for (const [day, v] of byDay) {
+        await client.query(
+          `INSERT INTO processing_milk_received
+             (upload_id, day, farm_litres, mwabulugu_litres, purchased_litres, damaged_litres)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [uploadId, day, v.farm, v.mwabulugu, v.purchased, v.damaged]
+        );
+      }
 
-        } else if (r.section === 'PROCESSED') {
-          packed.push({ day: r.day, product: r.group, size: r.category, units: r.quantity });
-
-        } else if (r.section === 'ISSUED') {
-          issued.push({ day: r.day, product: r.group, size: r.category, units: r.quantity });
-
-        } else if (r.section === 'PACKED') {
-          // Stock is a month total per product/size, not per-day.
-          const key = `${r.group}|${r.category}`;
-          stockByKey[key] = (stockByKey[key] || 0) + r.quantity;
+      /* ── daily pack movements ── */
+      const insertDaily = async (table, rows) => {
+        for (const r of rows) {
+          await client.query(
+            `INSERT INTO ${table} (upload_id, day, product, size, units, litres)
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [uploadId, r.day, r.product, r.size, r.units, r.litres]
+          );
         }
-      }
+      };
+      await insertDaily('processing_packed',  m.packed);
+      await insertDaily('processing_issued',  m.issued);
+      await insertDaily('processing_damaged', m.damaged);
 
-      // 1. Milk received
-      for (const [day, v] of Object.entries(receivedByDay)) {
+      /* ── closing stock, with the movements that produced it ── */
+      for (const s of m.stock) {
         await client.query(
-          `INSERT INTO processing_milk_received(upload_id, day, farm_litres, purchased_litres)
-           VALUES($1,$2,$3,$4)`,
-          [uploadId, parseInt(day, 10), v.farm, v.purchased]
+          `INSERT INTO processing_stock
+             (upload_id, product, size, opening_units, packed_units,
+              issued_units, damaged_units, units, litres)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [uploadId, s.product, s.size, s.opening, s.packed,
+           s.issued, s.damaged, s.closing, s.closing_litres]
         );
       }
 
-      // 2. Processed (packed daily units)
-      for (const r of packed) {
-        await client.query(
-          `INSERT INTO processing_packed(upload_id, day, product, size, units, litres)
-           VALUES($1,$2,$3,$4,$5,$6)`,
-          [uploadId, r.day, r.product, r.size, r.units, 0]
-        );
-      }
-
-      // 3. Issued
-      for (const r of issued) {
-        await client.query(
-          `INSERT INTO processing_issued(upload_id, day, product, size, units, litres)
-           VALUES($1,$2,$3,$4,$5,$6)`,
-          [uploadId, r.day, r.product, r.size, r.units, 0]
-        );
-      }
-
-      // 4. Stock (month totals per product/size)
-      for (const [key, units] of Object.entries(stockByKey)) {
-        const [product, size] = key.split('|');
-        await client.query(
-          `INSERT INTO processing_stock(upload_id, product, size, units)
-           VALUES($1,$2,$3,$4)`,
-          [uploadId, product, size, units]
-        );
-      }
-
+      const total = (rows, key) => rows.reduce((a, r) => a + (r[key] || 0), 0);
       results.push({
         upload_id: uploadId,
-        label,
+        label: m.label,
+        source: m.source,
+        sheets: m.sheets,
         summary: {
-          received_days: Object.keys(receivedByDay).length,
-          packed_rows:   packed.length,
-          issued_rows:   issued.length,
-          stock_rows:    Object.keys(stockByKey).length,
+          received_litres: Math.round(total(m.received, 'litres') * 10) / 10,
+          packed_units:    total(m.packed, 'units'),
+          packed_litres:   Math.round(total(m.packed, 'litres') * 10) / 10,
+          issued_units:    total(m.issued, 'units'),
+          damaged_units:   total(m.damaged, 'units'),
+          closing_units:   total(m.stock, 'closing'),
         },
       });
     }
@@ -1369,6 +1387,9 @@ app.post('/api/processing/upload', verifyToken, upload.single('file'), async (re
       success:         true,
       months_imported: results.length,
       months:          results,
+      // The client shows the newest month it just imported.
+      upload_id:       results[0]?.upload_id ?? null,
+      warnings:        parsed.warnings,
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1377,7 +1398,7 @@ app.post('/api/processing/upload', verifyToken, upload.single('file'), async (re
     client.release();
   }
 });
- 
+
 /* Delete an upload */
 app.delete('/api/processing/:id', verifyToken, async (req, res) => {
   try {

@@ -151,6 +151,41 @@ async function initDB() {
       ALTER TABLE users ALTER COLUMN role SET DEFAULT 'veteran';
     `);
 
+    /* Processing unit: figures the original tables had nowhere to put.
+
+       The farm's own workbook carries a stock balance forward from one month
+       to the next, splits milk received across three sources rather than two,
+       and records raw milk spoiled before packing separately from packs
+       written off after it. Without these columns an upload silently lost all
+       of that, and closing stock could only ever be guessed at. */
+    await client.query(`
+      ALTER TABLE processing_uploads
+        ADD COLUMN IF NOT EXISTS opening_fresh_litres NUMERIC NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS fresh_damage_litres  NUMERIC NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS month_num            INTEGER,
+        ADD COLUMN IF NOT EXISTS year                 INTEGER,
+        ADD COLUMN IF NOT EXISTS source               TEXT;
+
+      ALTER TABLE processing_milk_received
+        ADD COLUMN IF NOT EXISTS mwabulugu_litres NUMERIC NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS damaged_litres   NUMERIC NOT NULL DEFAULT 0;
+
+      /* processing_stock.units is the CLOSING balance. The movements that
+         produce it are stored alongside so the figure can be explained
+         without re-reading the daily tables. */
+      ALTER TABLE processing_stock
+        ADD COLUMN IF NOT EXISTS opening_units NUMERIC NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS packed_units  NUMERIC NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS issued_units  NUMERIC NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS damaged_units NUMERIC NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS litres        NUMERIC NOT NULL DEFAULT 0;
+
+      /* One upload per month, enforced rather than assumed: the upload route
+         replaces a month by label, and a duplicate row would leave the old
+         figures visible beside the new ones. */
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_proc_uploads_label ON processing_uploads(label);
+    `);
+
     /* Seed a default admin if no users exist yet */
     const { rows } = await client.query('SELECT COUNT(*) FROM users');
     if (parseInt(rows[0].count) === 0) {
