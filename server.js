@@ -218,9 +218,18 @@ function parseDate(val) {
 ══════════════════════════════════ */
 app.get('/api/cows', verifyToken, async (req, res) => {
   try {
+    /* The herd list means the herd you have, so archived animals are left
+       out unless they are asked for. Their records are untouched either
+       way — this filters who is shown, never what is stored. */
+    const status = String(req.query.status || 'active').toLowerCase();
+    const where = status === 'all'      ? ''
+                : status === 'archived' ? `WHERE c.status <> 'active'`
+                :                         `WHERE c.status = 'active'`;
+
     const { rows } = await pool.query(`
       SELECT
         c.id, c.name, c.tag, c.breed, c.created_at,
+        c.status, TO_CHAR(c.archived_at, 'YYYY-MM-DD') AS archived_at, c.archived_note,
         COUNT(r.id)::int                      AS record_count,
         ROUND(AVG(r.litres)::numeric, 2)      AS avg_litres,
         ROUND(SUM(r.litres)::numeric, 2)      AS total_litres,
@@ -231,6 +240,7 @@ app.get('/api/cows', verifyToken, async (req, res) => {
         MAX(r.date)                            AS last_date
       FROM cows c
       LEFT JOIN milk_records r ON r.cow_id = c.id
+      ${where}
       GROUP BY c.id
       ORDER BY avg_litres DESC NULLS LAST
     `);
@@ -254,8 +264,110 @@ app.post('/api/cows', verifyToken, requireAdmin, async (req, res) => {
   }
 });
 
+/* Take an animal out of the herd without touching her records.
+
+   This is what a death, a sale or a culling calls for — the opposite of a
+   delete. She stops appearing in the herd list, stops counting toward
+   current averages and stops raising alerts, while every litre she produced
+   still counts toward the totals for the period she was alive.
+
+   Open to managers as well as admins: animals leave the herd as a matter of
+   routine, and routing that through an admin would push people back toward
+   the delete button. */
+const ARCHIVE_REASONS = ['dead', 'sold', 'culled'];
+
+app.post('/api/cows/:id/archive', verifyToken, requireProduction, async (req, res) => {
+  const status = String(req.body?.status || '').toLowerCase();
+  const note   = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 500) : '';
+  const date   = /^\d{4}-\d{2}-\d{2}$/.test(req.body?.date || '') ? req.body.date : null;
+
+  if (!ARCHIVE_REASONS.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${ARCHIVE_REASONS.join(', ')}` });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `UPDATE cows
+          SET status = $1,
+              archived_at = COALESCE($2::date, CURRENT_DATE),
+              archived_note = NULLIF($3, ''),
+              archived_by = $4
+        WHERE id = $5
+        RETURNING id, name, status, TO_CHAR(archived_at, 'YYYY-MM-DD') AS archived_at, archived_note`,
+      [status, date, note, req.user.id, req.params.id]
+    );
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Cow not found' });
+    }
+
+    // Leaving the herd is part of the animal's story, so it goes on her timeline.
+    await client.query(
+      `INSERT INTO cow_history (cow_id, event_type, date, source, notes)
+       VALUES ($1, $2, COALESCE($3::date, CURRENT_DATE), 'archive', NULLIF($4, ''))`,
+      [req.params.id, status, date, note]
+    );
+
+    await client.query('COMMIT');
+    res.json(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/* Undo an archive that was made in error. */
+app.post('/api/cows/:id/restore', verifyToken, requireProduction, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE cows
+          SET status = 'active', archived_at = NULL, archived_note = NULL, archived_by = NULL
+        WHERE id = $1
+        RETURNING id, name, status`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Cow not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* Permanently remove a cow and everything recorded about her.
+
+   This is for a row that should never have existed — a duplicate, a name
+   typed twice. For an animal that has left the herd, archive her instead:
+   deleting cascades through milk_records, cow_health_records, pregnancies,
+   disease_cows and cow_history, which rewrites past totals that were
+   correct when they were reported.
+
+   A cow with production history cannot be deleted without saying so
+   explicitly, so this cannot be reached by clicking through a dialog. */
 app.delete('/api/cows/:id', verifyToken, requireAdmin, async (req, res) => {
   try {
+    const { rows } = await pool.query(
+      `SELECT c.name, COUNT(r.id)::int AS record_count
+         FROM cows c LEFT JOIN milk_records r ON r.cow_id = c.id
+        WHERE c.id = $1 GROUP BY c.name`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Cow not found' });
+
+    const { name, record_count } = rows[0];
+    if (record_count > 0 && req.query.force !== 'true') {
+      return res.status(409).json({
+        error: `${name} has ${record_count} milk records. Deleting her removes them from `
+             + `the farm's history and changes past totals. Archive her instead, or repeat `
+             + `this request with force=true if the record is genuinely a mistake.`,
+        record_count,
+        archive_instead: `/api/cows/${req.params.id}/archive`,
+      });
+    }
+
     await pool.query('DELETE FROM cows WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (err) {
@@ -469,8 +581,12 @@ app.post('/api/import', verifyToken, upload.single('file'), async (req, res) => 
 app.get('/api/analytics/summary', verifyToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
+      /* Head count is the herd you have today; every other figure here is
+         history and keeps the milk archived animals produced. Dropping their
+         records would change totals that were correct when reported. */
       SELECT
-        COALESCE(COUNT(DISTINCT c.id)::int,0)        AS total_cows,
+        COALESCE(COUNT(DISTINCT c.id) FILTER (WHERE c.status = 'active')::int, 0) AS total_cows,
+        COALESCE(COUNT(DISTINCT c.id) FILTER (WHERE c.status <> 'active')::int, 0) AS archived_cows,
         COALESCE(COUNT(r.id)::int,0)                 AS total_records,
         COALESCE(ROUND(SUM(r.litres)::numeric,1),0)  AS total_litres,
         COALESCE(ROUND(AVG(r.litres)::numeric,2),0)  AS overall_avg,
@@ -749,7 +865,7 @@ app.get('/api/alerts', verifyToken, async (req, res) => {
       FROM latest l
       JOIN averages a ON a.cow_id = l.cow_id
       JOIN cows c ON c.id = l.cow_id
-      WHERE l.litres < a.avg_litres * 0.75
+      WHERE c.status = 'active' AND l.litres < a.avg_litres * 0.75
       ORDER BY drop_pct DESC
     `);
     for (const r of prodDrops) {
@@ -766,7 +882,8 @@ app.get('/api/alerts', verifyToken, async (req, res) => {
       SELECT c.name AS cow_name, TO_CHAR(p.expected_due_date,'YYYY-MM-DD') AS due_date,
         (p.expected_due_date - CURRENT_DATE)::int AS days_remaining
       FROM pregnancies p JOIN cows c ON c.id = p.cow_id
-      WHERE p.status = 'active' AND p.expected_due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 14
+      WHERE c.status = 'active'
+        AND p.status = 'active' AND p.expected_due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 14
       ORDER BY p.expected_due_date ASC
     `);
     for (const b of births) {
@@ -783,7 +900,8 @@ app.get('/api/alerts', verifyToken, async (req, res) => {
       SELECT c.name AS cow_name, TO_CHAR(p.expected_due_date,'YYYY-MM-DD') AS due_date,
         (CURRENT_DATE - p.expected_due_date)::int AS days_overdue
       FROM pregnancies p JOIN cows c ON c.id = p.cow_id
-      WHERE p.status = 'active' AND p.expected_due_date < CURRENT_DATE
+      WHERE c.status = 'active'
+        AND p.status = 'active' AND p.expected_due_date < CURRENT_DATE
     `);
     for (const o of overdue) {
       alerts.push({
@@ -1209,7 +1327,7 @@ app.get('/api/alerts/daily', verifyToken, async (req, res) => {
       FROM overall o
       JOIN recent r ON r.cow_id = o.cow_id
       JOIN cows c ON c.id = o.cow_id
-      WHERE r.avg_recent < o.avg_all * 0.80
+      WHERE c.status = 'active' AND r.avg_recent < o.avg_all * 0.80
       ORDER BY drop_pct DESC
     `);
     for (const r of prodRows) {
@@ -1226,7 +1344,8 @@ app.get('/api/alerts/daily', verifyToken, async (req, res) => {
       SELECT c.name AS cow_name, p.expected_due_date,
              (p.expected_due_date - CURRENT_DATE)::int AS days_remaining
       FROM pregnancies p JOIN cows c ON c.id = p.cow_id
-      WHERE p.status = 'active'
+      WHERE c.status = 'active'
+        AND p.status = 'active'
         AND p.expected_due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 14
       ORDER BY p.expected_due_date ASC
     `);
