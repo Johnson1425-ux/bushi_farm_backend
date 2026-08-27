@@ -616,6 +616,68 @@ app.get('/api/analytics/trend', verifyToken, async (req, res) => {
   }
 });
 
+/* Whole-farm production, one row per calendar month.
+
+   Deliberately not filtered by cow status: this is history, and a cow that
+   has since died or been sold still produced the milk credited to the month
+   she produced it in. Filtering archived animals out here would make last
+   year's totals change every time an animal leaves the herd.
+
+   `days_recorded` counts days that actually have readings rather than days
+   in the month, so avg_per_day is not dragged down by days nobody milked —
+   a half-entered month reads as a half-entered month, not a bad one. */
+app.get('/api/analytics/monthly', verifyToken, async (req, res) => {
+  const cowId = parseInt(req.query.cow_id, 10);
+  const args = [];
+  let where = '';
+  if (Number.isInteger(cowId)) { args.push(cowId); where = 'WHERE cow_id = $1'; }
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT TO_CHAR(date, 'YYYY-MM')                AS month,
+             ROUND(SUM(litres)::numeric, 1)          AS total_litres,
+             COUNT(*)::int                           AS records,
+             COUNT(DISTINCT cow_id)::int             AS cows_milked,
+             COUNT(DISTINCT date)::int               AS days_recorded,
+             ROUND(AVG(litres)::numeric, 2)          AS avg_per_record,
+             ROUND((SUM(litres) / NULLIF(COUNT(DISTINCT date), 0))::numeric, 1) AS avg_per_day,
+             ROUND(MAX(litres)::numeric, 1)          AS best_single_record
+      FROM milk_records
+      ${where}
+      GROUP BY 1
+      ORDER BY 1 DESC
+    `, args);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* Which cows made up one month's total. The obvious next question after
+   seeing a month move, so it is one request away rather than a page away. */
+app.get('/api/analytics/monthly/:month', verifyToken, async (req, res) => {
+  const month = String(req.params.month || '');
+  if (!/^\d{4}-\d{2}$/.test(month)) {
+    return res.status(400).json({ error: 'month must be formatted YYYY-MM' });
+  }
+  try {
+    const { rows } = await pool.query(`
+      SELECT c.id, c.name, c.tag, c.status,
+             ROUND(SUM(r.litres)::numeric, 1)  AS total_litres,
+             ROUND(AVG(r.litres)::numeric, 2)  AS avg_litres,
+             COUNT(r.id)::int                  AS days_recorded
+      FROM milk_records r
+      JOIN cows c ON c.id = r.cow_id
+      WHERE TO_CHAR(r.date, 'YYYY-MM') = $1
+      GROUP BY c.id
+      ORDER BY total_litres DESC
+    `, [month]);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/analytics/compare', verifyToken, async (req, res) => {
   const ids = (req.query.ids||'').split(',').map(Number).filter(Boolean);
   if (!ids.length) return res.status(400).json({ error: 'ids required' });
