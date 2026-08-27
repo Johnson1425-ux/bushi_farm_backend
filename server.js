@@ -337,6 +337,35 @@ app.post('/api/cows/:id/restore', verifyToken, requireProduction, async (req, re
   }
 });
 
+/* Wipe the herd and everything recorded about it, in one statement.
+
+   This is what the "Clear all data" button needs. It used to be a loop of
+   per-cow deletes from the browser, which the guard below now blocks on the
+   first animal that has records — and which could leave the farm half
+   deleted if it failed partway, since each request stood alone.
+
+   A single DELETE cascades through milk_records, cow_health_records,
+   pregnancies, disease_cows and cow_history, and either all of it goes or
+   none of it does. Archived cows go too: this clears everything, and a
+   herd list filtered to active animals would have quietly left them behind.
+
+   The confirm parameter is required so this cannot be reached by a stray
+   DELETE to a collection URL. */
+app.delete('/api/cows', verifyToken, requireAdmin, async (req, res) => {
+  if (req.query.confirm !== 'DELETE_ALL') {
+    return res.status(400).json({
+      error: 'Refusing to delete every cow without confirm=DELETE_ALL. '
+           + 'To retire a single animal, archive her instead.',
+    });
+  }
+  try {
+    const { rowCount } = await pool.query('DELETE FROM cows');
+    res.json({ ok: true, deleted: rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* Permanently remove a cow and everything recorded about her.
 
    This is for a row that should never have existed — a duplicate, a name
