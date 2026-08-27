@@ -544,7 +544,10 @@ const CHAT_TOOLS = [
     description:
       'List every cow in the herd with tag, breed, lifetime average yield, and the date '
       + 'she was last milked. Call this first when the question mentions a cow by a name '
-      + 'you have not seen yet, or when you need to know how large the herd is.',
+      + 'you have not seen yet, or when you need to know how large the herd is. Animals '
+      + 'that have died, been sold or been culled come back separately under '
+      + 'no_longer_in_herd with the date they left — they are not part of the herd size, '
+      + 'and should never be described as currently producing.',
     input_schema: { type: 'object', properties: {}, required: [] },
   },
   {

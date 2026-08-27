@@ -202,6 +202,32 @@ async function initDB() {
           ADD COLUMN IF NOT EXISTS litres        NUMERIC NOT NULL DEFAULT 0;
       `],
 
+      /* An animal leaves the herd without leaving the records.
+
+         Deleting a cow row cascades through milk_records, cow_health_records,
+         pregnancies, disease_cows and cow_history, so a death used to erase
+         every trace of her — including the milk she really did produce, which
+         quietly changed last year's farm totals. Archiving takes her out of
+         the active herd and leaves all of that intact.
+
+         `status` doubles as the reason she left, so there is no second column
+         that can disagree with it. */
+      ['cows archive status', `
+        ALTER TABLE cows
+          ADD COLUMN IF NOT EXISTS status        TEXT NOT NULL DEFAULT 'active',
+          ADD COLUMN IF NOT EXISTS archived_at   DATE,
+          ADD COLUMN IF NOT EXISTS archived_note TEXT,
+          ADD COLUMN IF NOT EXISTS archived_by   INTEGER REFERENCES users(id) ON DELETE SET NULL;
+
+        ALTER TABLE cows DROP CONSTRAINT IF EXISTS cows_status_check;
+        UPDATE cows SET status = 'active'
+          WHERE status IS NULL OR status NOT IN ('active', 'dead', 'sold', 'culled');
+        ALTER TABLE cows ADD CONSTRAINT cows_status_check
+          CHECK (status IN ('active', 'dead', 'sold', 'culled'));
+
+        CREATE INDEX IF NOT EXISTS idx_cows_status ON cows(status);
+      `],
+
       /* One upload per month, enforced rather than assumed: the upload route
          replaces a month by label, and a duplicate row would leave the old
          figures visible beside the new ones. Older rows are de-duplicated

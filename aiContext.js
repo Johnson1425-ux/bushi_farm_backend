@@ -101,7 +101,7 @@ async function productionContext({ from, to, prevFrom, prevTo }) {
         SELECT cow_id, ROUND(AVG(litres)::numeric, 2) AS prev_avg_litres
         FROM milk_records WHERE date BETWEEN $3 AND $4 GROUP BY cow_id
       )
-      SELECT c.name, c.tag, c.breed,
+      SELECT c.name, c.tag, c.breed, c.status,
              cur.avg_litres, cur.total_litres, cur.records,
              prev.prev_avg_litres,
              CASE WHEN prev.prev_avg_litres > 0
@@ -119,6 +119,8 @@ async function productionContext({ from, to, prevFrom, prevTo }) {
     name: r.name,
     tag: r.tag,
     breed: r.breed,
+    // Present only when she has left the herd, so 'active' stays unstated.
+    status: r.status === 'active' ? undefined : r.status,
     avg_litres: num(r.avg_litres),
     total_litres: num(r.total_litres),
     records: r.records,
@@ -533,26 +535,47 @@ async function processingMonth(label) {
 
 async function herdContext() {
   const { rows } = await pool.query(`
-    SELECT c.name, c.tag, c.breed,
+    SELECT c.name, c.tag, c.breed, c.status,
+           TO_CHAR(c.archived_at, 'YYYY-MM-DD') AS left_herd_on,
+           c.archived_note,
            COUNT(r.id)::int               AS lifetime_records,
            ROUND(AVG(r.litres)::numeric, 2) AS lifetime_avg_litres,
            TO_CHAR(MAX(r.date), 'YYYY-MM-DD') AS last_milked
     FROM cows c LEFT JOIN milk_records r ON r.cow_id = c.id
     GROUP BY c.id ORDER BY c.name
   `);
-  return rows.map(r => ({
+
+  const shape = (r) => ({
     name: r.name, tag: r.tag, breed: r.breed,
     lifetime_records: r.lifetime_records,
     lifetime_avg_litres: num(r.lifetime_avg_litres),
     last_milked: r.last_milked,
-  }));
+  });
+
+  /* Split rather than tagged, so "how many cows are there" cannot be answered
+     with a number that includes animals which have died or been sold. Their
+     figures are still here to answer questions about them. */
+  return {
+    herd_size: rows.filter(r => r.status === 'active').length,
+    cows: rows.filter(r => r.status === 'active').map(shape),
+    no_longer_in_herd: rows.filter(r => r.status !== 'active').map(r => ({
+      ...shape(r),
+      status: r.status,
+      left_herd_on: r.left_herd_on,
+      note: r.archived_note || undefined,
+    })),
+  };
 }
 
 /* ── single cow dossier ──────────────────────────────────── */
 
 async function cowDossier(cowId) {
   const { rows: cowRows } = await pool.query(
-    'SELECT id, name, tag, breed, TO_CHAR(created_at, \'YYYY-MM-DD\') AS added_on FROM cows WHERE id = $1',
+    `SELECT id, name, tag, breed, status,
+            TO_CHAR(created_at, 'YYYY-MM-DD')  AS added_on,
+            TO_CHAR(archived_at, 'YYYY-MM-DD') AS archived_at,
+            archived_note
+       FROM cows WHERE id = $1`,
     [cowId]
   );
   const cow = cowRows[0];
@@ -677,7 +700,7 @@ async function alertSignals() {
       FROM overall o
       JOIN recent r ON r.cow_id = o.cow_id
       JOIN cows c   ON c.id = o.cow_id
-      WHERE r.avg_recent < o.avg_all * 0.80
+      WHERE c.status = 'active' AND r.avg_recent < o.avg_all * 0.80
       ORDER BY drop_pct DESC
     `),
 
@@ -686,7 +709,8 @@ async function alertSignals() {
              TO_CHAR(p.expected_due_date, 'YYYY-MM-DD') AS expected_due_date,
              (p.expected_due_date - CURRENT_DATE)::int  AS days_remaining
       FROM pregnancies p JOIN cows c ON c.id = p.cow_id
-      WHERE p.status = 'active'
+      WHERE c.status = 'active'
+        AND p.status = 'active'
         AND p.expected_due_date BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE + 21
       ORDER BY p.expected_due_date
     `),
@@ -710,6 +734,7 @@ async function alertSignals() {
       SELECT c.name, TO_CHAR(MAX(r.date), 'YYYY-MM-DD') AS last_record,
              (CURRENT_DATE - MAX(r.date))::int AS days_since
       FROM cows c JOIN milk_records r ON r.cow_id = c.id
+      WHERE c.status = 'active'
       GROUP BY c.id, c.name
       HAVING (CURRENT_DATE - MAX(r.date))::int BETWEEN 3 AND 60
       ORDER BY days_since DESC LIMIT 20
