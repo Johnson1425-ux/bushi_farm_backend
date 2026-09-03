@@ -678,7 +678,7 @@ async function runChatTool(name, input) {
 }
 
 const CHAT_SYSTEM = `
-You are answering questions about Bushi Farm's records using the tools provided.
+You are answering questions about Milktrack's records using the tools provided.
 
 - Always fetch data before answering. Never answer a factual question about the
   farm from memory or from earlier turns alone if a tool can confirm it.
