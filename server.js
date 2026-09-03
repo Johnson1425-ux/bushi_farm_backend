@@ -607,26 +607,61 @@ app.post('/api/import', verifyToken, upload.single('file'), async (req, res) => 
 /* ══════════════════════════════════
    ANALYTICS  (all authenticated)
 ══════════════════════════════════ */
+
 app.get('/api/analytics/summary', verifyToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      /* Head count is the herd you have today; every other figure here is
-         history and keeps the milk archived animals produced. Dropping their
-         records would change totals that were correct when reported. */
+      /* Head count is the herd you have today; historical milk records
+         remain included in the overall analytics. */
+
       SELECT
-        COALESCE(COUNT(DISTINCT c.id) FILTER (WHERE c.status = 'active')::int, 0) AS total_cows,
-        COALESCE(COUNT(DISTINCT c.id) FILTER (WHERE c.status <> 'active')::int, 0) AS archived_cows,
-        COALESCE(COUNT(r.id)::int,0)                 AS total_records,
-        COALESCE(ROUND(SUM(r.litres)::numeric,1),0)  AS total_litres,
-        COALESCE(ROUND(AVG(r.litres)::numeric,2),0)  AS overall_avg,
-        COALESCE(COUNT(DISTINCT r.date)::int,0)      AS days_tracked,
-        TO_CHAR(MIN(r.date),'YYYY-MM-DD')            AS first_date,
-        TO_CHAR(MAX(r.date),'YYYY-MM-DD')            AS last_date
-      FROM cows c LEFT JOIN milk_records r ON r.cow_id = c.id
+        COALESCE(
+          COUNT(DISTINCT c.id) FILTER (WHERE c.status = 'active')::int,
+          0
+        ) AS total_cows,
+
+        COALESCE(
+          COUNT(DISTINCT c.id) FILTER (WHERE c.status <> 'active')::int,
+          0
+        ) AS archived_cows,
+
+        COALESCE(COUNT(r.id)::int, 0) AS total_records,
+
+        /* Total litres recorded yesterday */
+        COALESCE(
+          ROUND(
+            SUM(r.litres) FILTER (
+              WHERE r.date = CURRENT_DATE - 1
+            )::numeric,
+            1
+          ),
+          0
+        ) AS total_litres,
+
+        COALESCE(
+          ROUND(AVG(r.litres)::numeric, 2),
+          0
+        ) AS overall_avg,
+
+        COALESCE(
+          COUNT(DISTINCT r.date)::int,
+          0
+        ) AS days_tracked,
+
+        TO_CHAR(MIN(r.date), 'YYYY-MM-DD') AS first_date,
+
+        TO_CHAR(MAX(r.date), 'YYYY-MM-DD') AS last_date
+
+      FROM cows c
+      LEFT JOIN milk_records r
+        ON r.cow_id = c.id
     `);
+
     res.json(rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message
+    });
   }
 });
 
@@ -738,26 +773,6 @@ app.get('/api/analytics/dates', verifyToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-/* ══════════════════════════════════
-   PUBLIC STATS  (no auth required)
-══════════════════════════════════ */
-// app.get('/api/public/stats', async (req, res) => {
-//   try {
-//     const { rows } = await pool.query(`
-//       SELECT
-//         COALESCE(COUNT(DISTINCT c.id)::int, 0)       AS total_cows,
-//         COALESCE(COUNT(r.id)::int, 0)                AS total_records,
-//         COALESCE(ROUND(SUM(r.litres)::numeric, 1), 0) AS total_litres,
-//         COALESCE(ROUND(AVG(r.litres)::numeric, 2), 0) AS overall_avg,
-//         COALESCE(COUNT(DISTINCT r.date)::int, 0)     AS days_tracked
-//       FROM cows c LEFT JOIN milk_records r ON r.cow_id = c.id
-//     `);
-//     res.json(rows[0]);
-//   } catch (err) {
-//     res.status(500).json({ error: err.message });
-//   }
-// });
 
 /* ══════════════════════════════════
    DISEASES & TREATMENTS
