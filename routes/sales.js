@@ -1,16 +1,32 @@
 const express = require('express');
-const multer  = require('multer');
-const XLSX    = require('xlsx');
 const { pool } = require('../db');
-const { parseDate } = require('../lib/parsers');
 
 const router = express.Router();
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
-});
 
-// NOTE: mounted in server.js as `app.use('/api/sales', verifyToken, requireProduction, salesRouter)`.
+/* ══════════════════════════════════════════════════════════════
+   BULK MILK, BEFORE THE TILLS  —  read only
+
+   Mounted in server.js as
+   `app.use('/api/sales', verifyToken, requireProduction, salesRouter)`.
+
+   This table is the hand-kept record of raw milk sold by the litre, from
+   before branches had a till. It is history and nothing more.
+
+   Milk sold loose is now an ordinary product measured in litres — see
+   lib/initStock.js — so it goes out on an issue note, sells at a branch
+   with a customer and a payment method against it, lands in that day's
+   cash-up and appears in the reports. None of which this table can do:
+   it knows a date, a quantity and a price, and nothing about where the
+   milk went or whether the money arrived.
+
+   Keeping a second way to record a sale would split the farm's revenue
+   across two places that never reconcile, so the writes are gone. The
+   rows themselves are not: they are last year's figures, and the AI
+   reports still surface them for periods that have them.
+
+   When these have been carried across — or judged not worth carrying —
+   the table and this file can go together.
+══════════════════════════════════════════════════════════════ */
 
 router.get('/', async (req, res) => {
   const { month, from, to } = req.query;
@@ -29,25 +45,6 @@ router.get('/', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-router.post('/', async (req, res) => {
-  const { date, litres_sold, price_per_litre, notes } = req.body;
-  if (!date || !litres_sold || !price_per_litre) return res.status(400).json({ error: 'date, litres_sold and price_per_litre required' });
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO sales(date, litres_sold, price_per_litre, notes) VALUES($1,$2,$3,$4) RETURNING *`,
-      [date, litres_sold, price_per_litre, notes || null]
-    );
-    res.status(201).json(rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-router.delete('/:id', async (req, res) => {
-  try {
-    await pool.query('DELETE FROM sales WHERE id=$1', [req.params.id]);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 router.get('/summary', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -62,29 +59,15 @@ router.get('/summary', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-router.post('/import', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  try {
-    const wb    = XLSX.read(req.file.buffer, { type: 'buffer' });
-    const sheet = wb.Sheets[wb.SheetNames[0]];
-    const rows  = XLSX.utils.sheet_to_json(sheet);
-    let imported = 0; const errors = [];
-    for (const row of rows) {
-      try {
-        const date   = parseDate(row['date'] || row['Date'] || row['DATE']);
-        const litres = parseFloat(row['litres_sold'] || row['Litres'] || row['LITRES'] || 0);
-        const price  = parseFloat(row['price_per_litre'] || row['Price'] || row['PRICE'] || 0);
-        if (!date || !litres || !price) { errors.push(`Skipped row: missing data`); continue; }
-        await pool.query(
-          `INSERT INTO sales(date,litres_sold,price_per_litre,notes) VALUES($1,$2,$3,$4)
-           ON CONFLICT(date) DO UPDATE SET litres_sold=EXCLUDED.litres_sold, price_per_litre=EXCLUDED.price_per_litre`,
-          [date, litres, price, row['notes'] || null]
-        );
-        imported++;
-      } catch (e) { errors.push(e.message); }
-    }
-    res.json({ imported, errors });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+/* Every write returns the same answer, and says where the sale belongs
+   instead — a 404 would suggest the endpoint had simply moved. */
+const closed = (req, res) => res.status(410).json({
+  error: 'Bulk milk is sold at a branch till now, which records who bought it, '
+       + 'how they paid, and puts it in the day\'s cash. This record is read-only history.',
 });
+
+router.post('/', closed);
+router.post('/import', closed);
+router.delete('/:id', closed);
 
 module.exports = router;
