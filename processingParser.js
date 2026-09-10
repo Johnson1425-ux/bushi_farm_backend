@@ -16,7 +16,14 @@
      these files, so refusing them would mean retyping all of it.
 
    Both paths produce the same result: one entry per month, with opening
-   balance, daily milk received, and daily packed / issued / damaged packs.
+   balance, daily milk received, and daily packed / damaged packs.
+
+   ISSUED is deliberately not read from either layout. The sheet records
+   one issued figure with no destination on it, and stock now leaves the
+   store on an issue note naming the branch it went to. Reading both would
+   give a month two answers to "how much went out" and no way to say which
+   one was right, so the block is recognised, skipped, and left to the
+   ledger — see lib/processingReconcile.js.
    Litres are always derived from the pack size, never read from the sheet,
    so a stale litres column in an old file cannot contradict the units.
 
@@ -107,13 +114,12 @@ function emptyMonth(period, sheetName, source) {
     openingFreshLitres: 0,
     received: [],
     packed: [],
-    issued: [],
     damaged: [],
     freshDamage: [],
   };
 }
 
-const SECTION_KEY = { PACKED: 'packed', ISSUED: 'issued', DAMAGED: 'damaged' };
+const SECTION_KEY = { PACKED: 'packed', DAMAGED: 'damaged' };
 
 /** Record one pack figure, deriving litres from the size. */
 function pushPack(month, section, { day, product, size, units }) {
@@ -271,7 +277,6 @@ function parseTemplateSheet(ws, sheetName, out) {
      so it is accepted as a fallback when there is no PACKED block. */
   const blocks = [
     ['PACKED', anchors.PACKED || anchors.PROCESSED, true],
-    ['ISSUED', anchors.ISSUED, true],
     ['DAMAGED', anchors.DAMAGED, false],
   ];
   for (const [section, anchorRow, required] of blocks) {
@@ -342,7 +347,9 @@ function classifyBlock(bannerText, sheetIsDamage) {
   if (/\bDAM[EA]GE/.test(t)) return 'DAMAGED';
   if (/\bLITRES?\b/.test(t)) return 'SKIP_LITRES';
   if (/\bSTOCK\b/.test(t)) return 'SKIP_STOCK';
-  if (/\bISSUED\b/.test(t)) return 'ISSUED';
+  /* Recognised so it is not reported as an unidentified block, then
+     skipped — issuing comes from the ledger now, not the sheet. */
+  if (/\bISSUED\b/.test(t)) return 'SKIP_ISSUED';
   if (/\bPACKED\b/.test(t) || /PROCESS(ED|ING) MILK/.test(t)) return 'PACKED';
   return null;
 }
@@ -464,10 +471,11 @@ function parseLegacySheet(ws, sheetName, period, out, monthsByLabel) {
 
   /* ── pack blocks ── */
   const blocks = findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow);
-  const counted = { PACKED: 0, ISSUED: 0, DAMAGED: 0 };
+  const counted = { PACKED: 0, DAMAGED: 0 };
 
   for (const block of blocks) {
-    if (block.kind === 'SKIP_LITRES' || block.kind === 'SKIP_STOCK') continue;
+    if (block.kind === 'SKIP_LITRES' || block.kind === 'SKIP_STOCK'
+        || block.kind === 'SKIP_ISSUED') continue;
     if (!block.kind) {
       out.warnings.push(
         `[${sheetName}] a block of product rows at row ${block.rows[0].row} could not be identified `
@@ -479,8 +487,8 @@ function parseLegacySheet(ws, sheetName, period, out, monthsByLabel) {
       out.errors.push(`[${sheetName}] the ${block.kind} block at row ${block.rows[0].row} has no date header row above it.`);
       continue;
     }
-    // A second PACKED/ISSUED block on one sheet means the layout is not what
-    // it appears to be; importing both would double the month.
+    // A second PACKED block on one sheet means the layout is not what it
+    // appears to be; importing both would double the month.
     if (counted[block.kind] && block.kind !== 'DAMAGED') {
       out.errors.push(
         `[${sheetName}] found a second ${block.kind} block at row ${block.rows[0].row}. `
@@ -560,7 +568,6 @@ function consolidate(m) {
     return [...map.values()];
   };
   m.packed = roll(m.packed, r => `${r.day}|${r.product}|${r.size}`);
-  m.issued = roll(m.issued, r => `${r.day}|${r.product}|${r.size}`);
   m.damaged = roll(m.damaged, r => `${r.day}|${r.product}|${r.size}`);
   m.opening = roll(m.opening, r => `${r.product}|${r.size}`);
 
@@ -576,39 +583,43 @@ function consolidate(m) {
 }
 
 /**
- * Closing stock per product/size: opening + packed − issued − damaged.
+ * What the sheet accounts for, per product/size: opening + packed − damaged.
  *
- * A negative closing figure means more went out than ever existed, which is
- * a counting mistake somewhere in the month rather than real stock, so it is
- * surfaced as a warning rather than quietly stored.
+ * This is NOT the closing balance. The sheet cannot know it, because issuing
+ * happens on issue notes in the app and carries on after the workbook is
+ * filed. Closing is worked out on every read as this figure less what the
+ * ledger issued that month — see lib/processingReconcile.js.
+ *
+ * A figure below zero here means more was written off than was ever made,
+ * which is a counting mistake on the sheet rather than real stock.
  */
 function computeStock(m, warnings) {
   const acc = new Map();
   const bump = (product, size, field, units) => {
     const k = `${product}|${size}`;
-    if (!acc.has(k)) acc.set(k, { product, size, opening: 0, packed: 0, issued: 0, damaged: 0 });
+    if (!acc.has(k)) acc.set(k, { product, size, opening: 0, packed: 0, damaged: 0 });
     acc.get(k)[field] += units;
   };
   for (const r of m.opening) bump(r.product, r.size, 'opening', r.units);
   for (const r of m.packed) bump(r.product, r.size, 'packed', r.units);
-  for (const r of m.issued) bump(r.product, r.size, 'issued', r.units);
   for (const r of m.damaged) bump(r.product, r.size, 'damaged', r.units);
 
   m.stock = [...acc.values()].map(s => {
-    const closing = s.opening + s.packed - s.issued - s.damaged;
-    if (closing < 0) {
+    const available = s.opening + s.packed - s.damaged;
+    if (available < 0) {
       warnings.push(
-        `[${m.label}] ${s.product} ${s.size} closes at ${closing}: `
-        + `${s.issued} issued and ${s.damaged} damaged against ${s.opening + s.packed} available.`
+        `[${m.label}] ${s.product} ${s.size} accounts for ${available}: `
+        + `${s.damaged} written off against ${s.opening + s.packed} made and carried in.`
       );
     }
     return {
       ...s,
-      closing,
+      issued: 0,
+      available,
       opening_litres: litresFor(s.size, s.opening),
-      closing_litres: litresFor(s.size, closing),
+      available_litres: litresFor(s.size, available),
     };
-  }).filter(s => s.opening || s.packed || s.issued || s.damaged);
+  }).filter(s => s.opening || s.packed || s.damaged);
 
   return m;
 }
@@ -666,12 +677,12 @@ function parseProcessingWorkbook(buffer) {
   for (const m of out.months) {
     consolidate(m);
     computeStock(m, out.warnings);
-    if (!m.received.length && !m.packed.length && !m.issued.length) {
+    if (!m.received.length && !m.packed.length) {
       out.warnings.push(`[${m.label}] no figures were found on this sheet.`);
     }
   }
   out.months = out.months.filter(m =>
-    m.received.length || m.packed.length || m.issued.length || m.damaged.length || m.opening.length);
+    m.received.length || m.packed.length || m.damaged.length || m.opening.length);
 
   if (!out.months.length && !out.errors.length) {
     out.errors.push('The workbook is laid out correctly but no figures have been entered in it yet.');

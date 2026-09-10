@@ -12,6 +12,8 @@
      • Never return raw rows for an unbounded table.
 ══════════════════════════════════════════════════════════════ */
 const { pool } = require('./db');
+const { applyIssued, ledgerIssuedDaily } = require('./lib/processingReconcile');
+const { litresFor } = require('./processingCatalog');
 
 /* ── helpers ─────────────────────────────────────────────── */
 
@@ -366,6 +368,28 @@ async function processingContext(limit = 2) {
 
   const ids = uploads.map(u => u.id);
 
+  /* Issuing, per upload, from the ledger rather than a workbook table.
+     Shaped like agg() below — upload_id, product, size, units, litres — so
+     everything downstream treats it as just another block of month figures. */
+  const issuedAcrossUploads = async (uploadRows) => {
+    const perUpload = await Promise.all(
+      uploadRows.map(u => ledgerIssuedDaily(pool, u).then(daily => ({ id: u.id, daily })))
+    );
+    const rows = [];
+    for (const { id, daily } of perUpload) {
+      const byProduct = new Map();
+      for (const r of daily) {
+        const k = `${r.product}|${r.size}`;
+        if (!byProduct.has(k)) byProduct.set(k, { upload_id: id, product: r.product, size: r.size, units: 0, litres: 0 });
+        const acc = byProduct.get(k);
+        acc.units  += r.units;
+        acc.litres += r.litres;
+      }
+      rows.push(...byProduct.values());
+    }
+    return { rows };
+  };
+
   const agg = (table) => pool.query(`
     SELECT upload_id, product, size,
            ROUND(SUM(units)::numeric, 1)  AS units,
@@ -385,12 +409,14 @@ async function processingContext(limit = 2) {
       FROM processing_milk_received WHERE upload_id = ANY($1) GROUP BY upload_id
     `, [ids]),
     agg('processing_packed'),
-    agg('processing_issued'),
+    /* Issuing is not in the workbook — it comes from the movement ledger,
+       keyed by the month each upload covers. See lib/processingReconcile.js. */
+    issuedAcrossUploads(uploads),
     agg('processing_damaged'),
     pool.query(`
       SELECT upload_id, product, size,
-             opening_units, packed_units, issued_units, damaged_units,
-             units AS closing_units, litres AS closing_litres
+             opening_units, packed_units, damaged_units,
+             units AS available_units, litres AS available_litres
       FROM processing_stock WHERE upload_id = ANY($1)
       ORDER BY product, size
     `, [ids]),
@@ -404,7 +430,14 @@ async function processingContext(limit = 2) {
     const p = byUpload(packed.rows, u.id);
     const i = byUpload(issued.rows, u.id);
     const d = byUpload(damaged.rows, u.id);
-    const s = byUpload(stock.rows, u.id);
+    /* The stored rows carry opening/packed/damaged and, in `units`, what the
+       sheet accounts for. Closing needs the ledger's issuing folded in, which
+       is exactly what applyIssued does. */
+    const s = applyIssued(
+      byUpload(stock.rows, u.id).map(r => ({ ...r, units: r.available_units, litres: r.available_litres })),
+      i.map(r => ({ product: r.product, size: r.size, units: num0(r.units) })),
+      { litresFor }
+    ).map(r => ({ ...r, closing_units: r.units, closing_litres: r.litres }));
 
     const sum = (rows, key) => rows.reduce((a, r) => a + num0(r[key]), 0);
     const receivedLitres = rec
@@ -453,9 +486,9 @@ async function processingContext(limit = 2) {
         fresh_milk_damaged_litres: num0(u.fresh_damage_litres),
         closing_units: sum(s, 'closing_units'),
         closing_litres: Math.round(sum(s, 'closing_litres') * 10) / 10,
-        /* Closing below zero is arithmetically impossible: it means the sheet
-           issued or wrote off more packs than were ever made. Naming the lines
-           keeps the model from reporting the negative total as real stock. */
+        /* Closing below zero is arithmetically impossible: more was issued or
+           written off than was ever made. Naming the lines keeps the model
+           from reporting the negative total as real stock. */
         negative_lines: s.filter(r => num0(r.closing_units) < 0)
           .map(r => ({ product: r.product, size: r.size, closing_units: num0(r.closing_units) })),
       },
@@ -463,7 +496,10 @@ async function processingContext(limit = 2) {
   });
 
   return {
-    note: 'Processing records are organised by month, not by calendar date, so they may '
+    note: 'Packs issued come from the in-app issue notes that send stock to a branch, not '
+        + 'from the workbook — the workbook\'s own issued column is no longer read. Closing '
+        + 'stock is opening + packed - issued - damaged, worked out on read. '
+        + 'Processing records are organised by month, not by calendar date, so they may '
         + 'not align exactly with the report period. Litres for packed, issued and damaged '
         + 'goods are derived from the pack size, not typed in.',
     months,
@@ -509,11 +545,11 @@ async function processingMonth(label) {
       FROM processing_milk_received WHERE upload_id = $1 ORDER BY day
     `, [up.id]),
     daily('processing_packed'),
-    daily('processing_issued'),
+    ledgerIssuedDaily(pool, up).then(r => ({ rows: r })),
     daily('processing_damaged'),
     pool.query(`
-      SELECT product, size, opening_units, packed_units, issued_units,
-             damaged_units, units AS closing_units, litres AS closing_litres
+      SELECT product, size, opening_units, packed_units,
+             damaged_units, units, litres
       FROM processing_stock WHERE upload_id = $1 ORDER BY product, size
     `, [up.id]),
   ]);
@@ -527,7 +563,7 @@ async function processingMonth(label) {
     daily_packed: packed.rows,
     daily_issued: issued.rows,
     daily_damaged: damaged.rows,
-    stock_by_product: stock.rows,
+    stock_by_product: applyIssued(stock.rows, issued.rows, { litresFor }),
   };
 }
 
@@ -758,24 +794,35 @@ async function alertSignals() {
      comes back rather than the row being dropped. */
   const { rows: procRows } = await pool.query(`
     WITH latest AS (
-      SELECT id, label, uploaded_at, fresh_damage_litres
+      SELECT id, label, month_num, year, uploaded_at, fresh_damage_litres
       FROM processing_uploads
       ORDER BY year DESC NULLS LAST, month_num DESC NULLS LAST, uploaded_at DESC
       LIMIT 1
     )
-    SELECT l.label,
+    SELECT l.id, l.label, l.month_num, l.year,
            (CURRENT_DATE - l.uploaded_at::date)::int AS days_since_upload,
            ROUND(l.fresh_damage_litres::numeric, 1)  AS fresh_damage_litres,
            (SELECT COALESCE(SUM(units), 0) FROM processing_packed  WHERE upload_id = l.id) AS packed_units,
            (SELECT COALESCE(SUM(units), 0) FROM processing_damaged WHERE upload_id = l.id) AS damaged_units,
            (SELECT COALESCE(SUM(litres), 0) FROM processing_packed WHERE upload_id = l.id) AS packed_litres,
            (SELECT COALESCE(SUM(farm_litres + mwabulugu_litres + purchased_litres), 0)
-              FROM processing_milk_received WHERE upload_id = l.id) AS received_litres,
-           (SELECT COALESCE(JSON_AGG(JSON_BUILD_OBJECT(
-                     'product', product, 'size', size, 'closing_units', units)), '[]')
-              FROM processing_stock WHERE upload_id = l.id AND units < 0) AS negative_stock
+              FROM processing_milk_received WHERE upload_id = l.id) AS received_litres
     FROM latest l
   `);
+
+  /* Impossible balances have to be worked out rather than queried: the
+     stored `units` is what the sheet accounts for, and a line only closes
+     below zero once the ledger's issuing is taken off it. */
+  const negativeStock = procRows[0] ? await (async () => {
+    const { rows: stockRows } = await pool.query(
+      'SELECT product, size, units, litres FROM processing_stock WHERE upload_id = $1',
+      [procRows[0].id]
+    );
+    const issued = await ledgerIssuedDaily(pool, procRows[0]);
+    return applyIssued(stockRows, issued, { litresFor })
+      .filter(r => num0(r.units) < 0)
+      .map(r => ({ product: r.product, size: r.size, closing_units: num0(r.units) }));
+  })() : [];
 
   const proc = procRows[0] ? (() => {
     const r = procRows[0];
@@ -795,7 +842,7 @@ async function alertSignals() {
         ? Math.round((num0(r.packed_litres) / receivedLitres) * 1000) / 10 : null,
       fresh_milk_damaged_litres: num0(r.fresh_damage_litres),
       // Impossible balances: more issued or written off than ever produced.
-      negative_stock_lines: r.negative_stock,
+      negative_stock_lines: negativeStock,
     };
   })() : null;
 
