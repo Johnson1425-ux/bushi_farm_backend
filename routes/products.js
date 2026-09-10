@@ -9,14 +9,15 @@ const router = express.Router();
 
    The catalogue itself is defined in processingCatalog.js and copied into
    this table at boot — see lib/initStock.js. What lives here and nowhere
-   else is the part the farm sets rather than the code: the selling price,
-   and whether a line is still being made. */
+   else is the part the farm sets rather than the code: the two selling
+   prices, and whether a line is still being made. */
 
 router.get('/', async (req, res) => {
   const where = req.query.active === 'true' ? 'WHERE active' : '';
   try {
     const { rows } = await pool.query(`
-      SELECT id, product, size, litres_per_pack, unit_price, active, sort_order
+      SELECT id, product, size, litres_per_pack,
+             retail_price, wholesale_price, active, sort_order
       FROM products ${where} ORDER BY sort_order, product, size
     `);
     res.json(rows);
@@ -31,18 +32,23 @@ router.get('/', async (req, res) => {
    its own history. A genuinely new line is added to the catalogue instead,
    where the template generator and the parser learn about it too. */
 router.patch('/:id', requireProduction, async (req, res) => {
-  const { unit_price, active } = req.body;
-  if (unit_price != null && !(Number(unit_price) >= 0)) {
-    return res.status(400).json({ error: 'unit_price must be zero or more' });
+  const { retail_price, wholesale_price, active } = req.body;
+  for (const [name, value] of [['retail_price', retail_price], ['wholesale_price', wholesale_price]]) {
+    if (value != null && !(Number(value) >= 0)) {
+      return res.status(400).json({ error: `${name} must be zero or more` });
+    }
   }
   try {
     const { rows } = await pool.query(
       `UPDATE products SET
-         unit_price = COALESCE($1, unit_price),
-         active     = COALESCE($2, active)
-       WHERE id = $3
-       RETURNING id, product, size, litres_per_pack, unit_price, active, sort_order`,
-      [unit_price != null ? Number(unit_price) : null,
+         retail_price    = COALESCE($1, retail_price),
+         wholesale_price = COALESCE($2, wholesale_price),
+         active          = COALESCE($3, active)
+       WHERE id = $4
+       RETURNING id, product, size, litres_per_pack,
+                 retail_price, wholesale_price, active, sort_order`,
+      [retail_price    != null ? Number(retail_price)    : null,
+       wholesale_price != null ? Number(wholesale_price) : null,
        typeof active === 'boolean' ? active : null,
        req.params.id]
     );

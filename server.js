@@ -38,6 +38,7 @@ const productsRoutes    = require('./routes/products');
 const stockRoutes       = require('./routes/stock');
 const issuesRoutes      = require('./routes/issues');
 const posRoutes         = require('./routes/pos');
+const reportsRoutes     = require('./routes/reports');
 
 const app = express();
 
@@ -130,6 +131,11 @@ app.use('/api/products', verifyToken, requireBranchAccess, productsRoutes);
 app.use('/api/stock',    verifyToken, requireBranchAccess, stockRoutes);
 app.use('/api/issues',   verifyToken, requireBranchAccess, issuesRoutes);
 app.use('/api/pos',      verifyToken, requireBranchAccess, posRoutes);
+
+/* Reports span every branch and are management's view of the business, so
+   they stay in manager territory rather than following the branch gate
+   above — an attendant reads their own day through /api/pos. */
+app.use('/api/reports',  verifyToken, requireProduction, reportsRoutes);
 
 /* Vet territory. */
 app.use('/api/diseases',       verifyToken, requireHealth, diseasesRoutes);
