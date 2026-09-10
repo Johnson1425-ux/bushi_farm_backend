@@ -3,6 +3,7 @@ const multer  = require('multer');
 const { pool } = require('../db');
 const { parseProcessingWorkbook } = require('../processingParser');
 const { buildProcessingTemplate } = require('../processingTemplate');
+const { canonical } = require('../processingCatalog');
 
 const router = express.Router();
 const upload = multer({
@@ -52,6 +53,61 @@ router.get('/template', async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+/**
+ * The workbook's ISSUED block against what was actually issued to branches.
+ *
+ * Since branch issuing moved into the app, the ledger is what happened and
+ * the workbook's single issued figure is a control total: a number typed up
+ * independently, which should agree. Where the two differ, one of them is
+ * wrong, and saying which product they differ on is what makes that
+ * findable — a month that only disagrees in the grand total tells the
+ * operator nothing about where to look.
+ *
+ * Months with no ledger activity at all — everything before the cutover —
+ * report nothing rather than flagging every line as a variance.
+ */
+async function issuedControlTotal(upload, excelIssued) {
+  if (!upload.month_num || !upload.year) return null;
+
+  const start = new Date(Date.UTC(upload.year, upload.month_num - 1, 1))
+    .toISOString().slice(0, 10);
+  const end = new Date(Date.UTC(upload.year, upload.month_num, 0))
+    .toISOString().slice(0, 10);
+
+  const { rows: ledger } = await pool.query(`
+    SELECT p.product, p.size, SUM(-m.units) AS units
+    FROM stock_movements m JOIN products p ON p.id = m.product_id
+    WHERE m.reason = 'issue_out' AND m.occurred_on BETWEEN $1 AND $2
+    GROUP BY p.product, p.size
+  `, [start, end]);
+
+  if (!ledger.length) return null;
+
+  const key = (product, size) => `${canonical(product)}|${canonical(size)}`;
+  const lines = new Map();
+  const bump = (product, size, field, units) => {
+    const k = key(product, size);
+    if (!lines.has(k)) lines.set(k, { product, size, excel: 0, ledger: 0 });
+    lines.get(k)[field] += Number(units) || 0;
+  };
+
+  /* Ledger rows first, so a line is labelled with the catalogue's spelling
+     rather than whichever variant the workbook happened to use — "0.5L"
+     reads as the product the operator knows, ".5L" as a typo they now have
+     to decode. A product only the workbook mentions keeps its own spelling,
+     which is the useful answer for a line the ledger has never seen. */
+  for (const r of ledger)      bump(r.product, r.size, 'ledger', r.units);
+  for (const r of excelIssued) bump(r.product, r.size, 'excel', r.units);
+
+  const all = [...lines.values()].map(l => ({ ...l, variance: l.ledger - l.excel }));
+  return {
+    from: start, to: end,
+    excel_units:  all.reduce((a, l) => a + l.excel, 0),
+    ledger_units: all.reduce((a, l) => a + l.ledger, 0),
+    lines: all.filter(l => l.variance !== 0).sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance)),
+  };
+}
+
 /* Full data for one upload — daily arrays plus the stock reconciliation. */
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
@@ -93,6 +149,7 @@ router.get('/:id', async (req, res) => {
       issued:   issued.rows,
       damaged:  damaged.rows,
       stock:    stock.rows,
+      issued_control: await issuedControlTotal(uploadRes.rows[0], issued.rows),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

@@ -149,21 +149,25 @@ async function initDB() {
 
        A step that fails now leaves the rest to apply, and says so loudly. */
     const migrations = [
-      /* Roles are admin / manager / veteran. Databases created before
-         'manager' and 'veteran' existed kept a two-value constraint that
-         rejected them, and 'viewer' has since been retired.
+      /* Roles are admin / manager / veteran / attendant. Databases created
+         before 'manager' and 'veteran' existed kept a two-value constraint
+         that rejected them, and 'viewer' has since been retired.
 
-         Anything outside the current three is moved to 'veteran', the most
-         limited role, rather than only 'viewer' — a database carrying some
-         other historical value would otherwise fail the CHECK below, and
-         narrowing an unknown role to the least privileged one is the safe
-         direction to be wrong in. */
+         'attendant' arrived with branch distribution: it runs one branch's
+         stock and till and nothing else. It must be listed here before any
+         such account can be created — and, just as importantly, before this
+         very migration demotes one, since it runs on every boot.
+
+         Anything outside the current four is moved to 'veteran' rather than
+         only 'viewer' — a database carrying some other historical value would
+         otherwise fail the CHECK below, and narrowing an unknown role to a
+         limited one is the safe direction to be wrong in. */
       ['users.role constraint', `
         ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
         UPDATE users SET role = 'veteran'
-          WHERE role IS NULL OR role NOT IN ('admin', 'manager', 'veteran');
+          WHERE role IS NULL OR role NOT IN ('admin', 'manager', 'veteran', 'attendant');
         ALTER TABLE users ADD CONSTRAINT users_role_check
-          CHECK (role IN ('admin', 'manager', 'veteran'));
+          CHECK (role IN ('admin', 'manager', 'veteran', 'attendant'));
         ALTER TABLE users ALTER COLUMN role SET DEFAULT 'veteran';
       `],
 
