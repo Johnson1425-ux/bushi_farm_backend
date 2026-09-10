@@ -6,11 +6,13 @@ const { pool, ready } = require('./db');
 const {
   verifyToken,
   requireAdmin, requireProduction, requireHealth, requireRoleForWrites,
+  requireBranchAccess,
 } = require('./auth');
 
 const aiRoutes         = require('./aiRoutes');
 const { initAiTables }  = require('./aiClient');
 const { initNewTables, initHealthRecordsTables } = require('./lib/initTables');
+const { initStockTables } = require('./lib/initStock');
 
 /* Route modules — one file per resource, each a plain express.Router().
    Role gates are applied once, here, at the mount point (see the "ROLE
@@ -30,6 +32,10 @@ const salesRoutes       = require('./routes/sales');
 const inventoryRoutes   = require('./routes/inventory');
 const processingRoutes  = require('./routes/processing');
 const healthRecordsRoutes = require('./routes/healthRecords');
+const branchesRoutes    = require('./routes/branches');
+const productsRoutes    = require('./routes/products');
+const stockRoutes       = require('./routes/stock');
+const issuesRoutes      = require('./routes/issues');
 
 const app = express();
 
@@ -49,7 +55,9 @@ app.options('*', cors(corsOptions));
 app.use(express.json());
 
 /* Start the schema work now, so a warm process has it done already. */
-const initAllTables = () => Promise.all([initAiTables(), initNewTables(), initHealthRecordsTables()]);
+const initAllTables = () => Promise.all([
+  initAiTables(), initNewTables(), initHealthRecordsTables(), initStockTables(),
+]);
 ready(initAllTables).catch(err => console.error('DB Init Error:', err.message));
 
 /* Nothing is served until the schema is in place.
@@ -100,6 +108,22 @@ app.use('/api/sales',      verifyToken, requireProduction, salesRoutes);
 app.use('/api/inventory',  verifyToken, requireProduction, inventoryRoutes);
 app.use('/api/processing', verifyToken, requireProduction, processingRoutes);
 app.use('/api/import',     verifyToken, requireProduction, importRoutes);
+
+/* ── Branch distribution ──────────────────────────────────
+   Wider than manager territory, because a branch attendant has to see the
+   catalogue, their own branch, its stock and the notes coming to it — and
+   nothing beyond that.
+
+   The role gate here is only the outer boundary. Which branch an attendant
+   may act on is decided inside each router by assertBranchAllowed(), from
+   the branch on their token rather than the id in the request, and the
+   write operations that belong to the store (raising and dispatching notes,
+   recording production, adjusting a balance) carry requireProduction on the
+   individual route. */
+app.use('/api/branches', verifyToken, requireBranchAccess, branchesRoutes);
+app.use('/api/products', verifyToken, requireBranchAccess, productsRoutes);
+app.use('/api/stock',    verifyToken, requireBranchAccess, stockRoutes);
+app.use('/api/issues',   verifyToken, requireBranchAccess, issuesRoutes);
 
 /* Vet territory. */
 app.use('/api/diseases',       verifyToken, requireHealth, diseasesRoutes);

@@ -36,15 +36,21 @@ function verifyToken(req, res, next) {
 /* ══════════════════════════════════
    ROLES
 
-   admin    — everything
-   manager  — production, sales, inventory, processing
-   veteran  — animal health: diseases, treatments, pregnancies, vet records
+   admin     — everything
+   manager   — production, sales, inventory, processing
+   veteran   — animal health: diseases, treatments, pregnancies, vet records
+   attendant — one branch: its stock, its incoming issue notes, its till
 
    Managers and vets share read access to the herd and the farm overview, but
    neither can see the other's area. Hiding a page in the sidebar is not a
    permission, so every restricted route is gated here as well.
+
+   An attendant is narrower still: the account carries a branch_id and sees
+   only that branch. The role alone is not the boundary — requireBranchAccess
+   below pins the request to the branch on the token, so an attendant cannot
+   reach another branch's stock by changing the id in the URL.
 ══════════════════════════════════ */
-const ROLES = ['admin', 'manager', 'veteran'];
+const ROLES = ['admin', 'manager', 'veteran', 'attendant'];
 
 /** Gate a route to specific roles. */
 function requireRole(...allowed) {
@@ -75,6 +81,45 @@ const requireAdmin      = requireRole('admin');
 const requireProduction = requireRole('admin', 'manager');
 /** Animal health: diseases, treatments, pregnancies, veterinary records. */
 const requireHealth     = requireRole('admin', 'veteran');
+/** Branch stock and, later, the till: managers oversee, attendants operate. */
+const requireBranchAccess = requireRole('admin', 'manager', 'attendant');
+
+/**
+ * Which branch this request may act on.
+ *
+ * Returns the branch an attendant is pinned to, ignoring whatever the request
+ * asked for — the token is the authority on where they work, not the URL.
+ * Admins and managers get the branch they asked for, or null for "all".
+ *
+ * `requested` may be absent, a string from a query parameter, or already a
+ * number; anything unparseable is treated as no branch chosen rather than as
+ * branch zero.
+ */
+function branchScope(req, requested) {
+  if (req.user?.role === 'attendant') {
+    return req.user.branch_id ?? null;
+  }
+  const id = parseInt(requested, 10);
+  return Number.isFinite(id) ? id : null;
+}
+
+/**
+ * Reject a branch-scoped request an attendant is not entitled to make.
+ *
+ * Call it wherever a route acts on one named branch. An attendant with no
+ * branch on their account can do nothing until an admin assigns one, which is
+ * the safe way for that misconfiguration to fail.
+ */
+function assertBranchAllowed(req, branchId) {
+  if (req.user?.role !== 'attendant') return null;
+  if (!req.user.branch_id) {
+    return 'This account is not assigned to a branch yet. Ask an admin to set one.';
+  }
+  if (Number(branchId) !== Number(req.user.branch_id)) {
+    return 'This account can only work with its own branch';
+  }
+  return null;
+}
 
 /* ══════════════════════════════════
    LOGIN THROTTLING
@@ -132,6 +177,7 @@ function clearLoginFailures(req) {
 module.exports = {
   verifyToken, SECRET, ROLES,
   requireRole, requireRoleForWrites,
-  requireAdmin, requireProduction, requireHealth,
+  requireAdmin, requireProduction, requireHealth, requireBranchAccess,
+  branchScope, assertBranchAllowed,
   loginRateLimit, recordLoginFailure, clearLoginFailures,
 };
