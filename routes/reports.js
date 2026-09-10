@@ -22,6 +22,8 @@ const router = express.Router();
                        workbook's CASH BALANCE sheet.
      products          what sold, split by the two price lists, so
                        counter trade and agent trade can be told apart.
+     debtors           who owes what, and how long it has been owed —
+                       the day book's debtor table, aged.
 
    Everything is built from receipts and cash-ups. Nothing here stores a
    figure of its own, so a report can never disagree with the day it
@@ -135,6 +137,9 @@ router.get('/cash-book', async (req, res) => {
         UNION
         SELECT DISTINCT business_day FROM pos_cash_ups
           WHERE business_day BETWEEN $1 AND $2 ${branchFilter}
+        UNION
+        SELECT DISTINCT entry_date FROM debtor_entries
+          WHERE kind = 'payment' AND entry_date BETWEEN $1 AND $2 ${branchFilter}
       ),
       takings AS (
         SELECT sold_on AS day,
@@ -151,7 +156,6 @@ router.get('/cash-book', async (req, res) => {
       ),
       ups AS (
         SELECT c.business_day AS day,
-               SUM(c.debtor_receipts) AS debtor_receipts,
                SUM(c.prepaids)        AS prepaids,
                SUM(c.counted_cash)    AS counted_cash,
                SUM(c.mobile_counted)  AS mobile_counted,
@@ -167,6 +171,14 @@ router.get('/cash-book', async (req, res) => {
         ) e ON e.cash_up_id = c.id
         WHERE c.business_day BETWEEN $1 AND $2 ${branchFilter}
         GROUP BY c.business_day
+      ),
+      /* Named "collected" rather than "receipts", which in this query
+         already means the number of sales rung up that day. */
+      collected AS (
+        SELECT entry_date AS day, SUM(-amount) AS debtor_receipts
+        FROM debtor_entries
+        WHERE kind = 'payment' AND entry_date BETWEEN $1 AND $2 ${branchFilter}
+        GROUP BY entry_date
       )
       SELECT TO_CHAR(d.day, 'YYYY-MM-DD') AS day,
              COALESCE(t.sales, 0)         AS sales,
@@ -177,7 +189,7 @@ router.get('/cash-book', async (req, res) => {
              COALESCE(t.discounts, 0)     AS discounts,
              COALESCE(t.receipts, 0)      AS receipts,
              COALESCE(u.expenses, 0)        AS expenses,
-             COALESCE(u.debtor_receipts, 0) AS debtor_receipts,
+             COALESCE(p.debtor_receipts, 0) AS debtor_receipts,
              COALESCE(u.prepaids, 0)        AS prepaids,
              COALESCE(u.counted_cash, 0)    AS counted_cash,
              COALESCE(u.mobile_counted, 0)  AS mobile_counted,
@@ -186,8 +198,9 @@ router.get('/cash-book', async (req, res) => {
              COALESCE(u.cash_ups, 0)        AS cash_ups,
              COALESCE(u.all_closed, FALSE)  AS closed
       FROM days d
-      LEFT JOIN takings t ON t.day = d.day
-      LEFT JOIN ups     u ON u.day = d.day
+      LEFT JOIN takings   t ON t.day = d.day
+      LEFT JOIN ups       u ON u.day = d.day
+      LEFT JOIN collected p ON p.day = d.day
       ORDER BY d.day
     `, params);
 
@@ -284,6 +297,86 @@ router.get('/products', async (req, res) => {
         units: sum('units'), litres: sum('litres'), revenue: sum('revenue'),
         retail_units: sum('retail_units'), retail_revenue: sum('retail_revenue'),
         wholesale_units: sum('wholesale_units'), wholesale_revenue: sum('wholesale_revenue'),
+      },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* ── who owes what ───────────────────────────────────────────
+   The day book's debtor table with an age against each balance. The paper
+   version carries a balance and nothing else, so a debt from March reads
+   exactly like one from last week; the ages here are the whole point of
+   putting it on a screen.
+
+   Accounts in credit are reported separately rather than netted off. A
+   customer who has overpaid is owed milk, and subtracting them from what
+   is owed to the farm would make both figures wrong. */
+router.get('/debtors', async (req, res) => {
+  const asOf = req.query.as_of || new Date().toISOString().slice(0, 10);
+
+  try {
+    const { rows } = await pool.query(`
+      WITH ledger AS (
+        SELECT d.id, d.name, d.phone, d.active, d.branch_id,
+               d.opening_balance + COALESCE(SUM(e.amount) FILTER (WHERE e.entry_date <= $1), 0) AS balance,
+               MAX(e.entry_date) FILTER (WHERE e.kind = 'payment') AS last_payment,
+               MAX(e.entry_date) FILTER (WHERE e.kind = 'charge')  AS last_charge,
+               COALESCE(SUM(e.amount)  FILTER (WHERE e.kind = 'charge'  AND e.entry_date <= $1), 0) AS charged,
+               COALESCE(SUM(-e.amount) FILTER (WHERE e.kind = 'payment' AND e.entry_date <= $1), 0) AS paid
+        FROM debtors d
+        LEFT JOIN debtor_entries e ON e.debtor_id = d.id
+        GROUP BY d.id
+      )
+      SELECT l.*, b.name AS branch_name,
+             CASE WHEN l.last_payment IS NULL AND l.last_charge IS NULL THEN NULL
+                  ELSE ($1::date - GREATEST(
+                    COALESCE(l.last_payment, '1900-01-01'::date),
+                    COALESCE(l.last_charge,  '1900-01-01'::date)))::int
+             END AS days_since_activity
+      FROM ledger l LEFT JOIN branches b ON b.id = l.branch_id
+      ORDER BY l.balance DESC, l.name
+    `, [asOf]);
+
+    const debtors = rows.map(r => ({
+      ...r,
+      balance: num(r.balance), charged: num(r.charged), paid: num(r.paid),
+    }));
+
+    const owing  = debtors.filter(d => d.balance >  0.005);
+    const credit = debtors.filter(d => d.balance < -0.005);
+
+    /* Aged by time since the account last moved, not since each charge was
+       raised. A running account is paid down as a whole rather than
+       invoice by invoice, so per-charge ageing would describe a way of
+       trading the farm does not do. */
+    const bucket = (d) => {
+      const days = d.days_since_activity;
+      if (days === null) return 'no activity';
+      if (days <= 30) return '0-30 days';
+      if (days <= 60) return '31-60 days';
+      if (days <= 90) return '61-90 days';
+      return 'over 90 days';
+    };
+    const ageing = {};
+    for (const d of owing) {
+      const key = bucket(d);
+      if (!ageing[key]) ageing[key] = { bucket: key, count: 0, amount: 0 };
+      ageing[key].count += 1;
+      ageing[key].amount = Math.round((ageing[key].amount + d.balance) * 100) / 100;
+    }
+
+    const sum = (list) => Math.round(list.reduce((a, d) => a + d.balance, 0) * 100) / 100;
+    res.json({
+      as_of: asOf,
+      debtors: debtors.map(d => ({ ...d, age_bucket: bucket(d) })),
+      ageing: ['0-30 days', '31-60 days', '61-90 days', 'over 90 days', 'no activity']
+        .map(k => ageing[k]).filter(Boolean),
+      totals: {
+        accounts: debtors.length,
+        owing_count: owing.length,
+        owed: sum(owing),
+        in_credit: sum(credit),
+        in_credit_count: credit.length,
       },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
