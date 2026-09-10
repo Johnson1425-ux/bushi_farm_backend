@@ -3,7 +3,8 @@ const multer  = require('multer');
 const { pool } = require('../db');
 const { parseProcessingWorkbook } = require('../processingParser');
 const { buildProcessingTemplate } = require('../processingTemplate');
-const { canonical } = require('../processingCatalog');
+const { litresFor } = require('../processingCatalog');
+const { reconcileUpload } = require('../lib/processingReconcile');
 
 const router = express.Router();
 const upload = multer({
@@ -53,62 +54,14 @@ router.get('/template', async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-/**
- * The workbook's ISSUED block against what was actually issued to branches.
- *
- * Since branch issuing moved into the app, the ledger is what happened and
- * the workbook's single issued figure is a control total: a number typed up
- * independently, which should agree. Where the two differ, one of them is
- * wrong, and saying which product they differ on is what makes that
- * findable — a month that only disagrees in the grand total tells the
- * operator nothing about where to look.
- *
- * Months with no ledger activity at all — everything before the cutover —
- * report nothing rather than flagging every line as a variance.
- */
-async function issuedControlTotal(upload, excelIssued) {
-  if (!upload.month_num || !upload.year) return null;
+/* Full data for one upload.
 
-  const start = new Date(Date.UTC(upload.year, upload.month_num - 1, 1))
-    .toISOString().slice(0, 10);
-  const end = new Date(Date.UTC(upload.year, upload.month_num, 0))
-    .toISOString().slice(0, 10);
-
-  const { rows: ledger } = await pool.query(`
-    SELECT p.product, p.size, SUM(-m.units) AS units
-    FROM stock_movements m JOIN products p ON p.id = m.product_id
-    WHERE m.reason = 'issue_out' AND m.occurred_on BETWEEN $1 AND $2
-    GROUP BY p.product, p.size
-  `, [start, end]);
-
-  if (!ledger.length) return null;
-
-  const key = (product, size) => `${canonical(product)}|${canonical(size)}`;
-  const lines = new Map();
-  const bump = (product, size, field, units) => {
-    const k = key(product, size);
-    if (!lines.has(k)) lines.set(k, { product, size, excel: 0, ledger: 0 });
-    lines.get(k)[field] += Number(units) || 0;
-  };
-
-  /* Ledger rows first, so a line is labelled with the catalogue's spelling
-     rather than whichever variant the workbook happened to use — "0.5L"
-     reads as the product the operator knows, ".5L" as a typo they now have
-     to decode. A product only the workbook mentions keeps its own spelling,
-     which is the useful answer for a line the ledger has never seen. */
-  for (const r of ledger)      bump(r.product, r.size, 'ledger', r.units);
-  for (const r of excelIssued) bump(r.product, r.size, 'excel', r.units);
-
-  const all = [...lines.values()].map(l => ({ ...l, variance: l.ledger - l.excel }));
-  return {
-    from: start, to: end,
-    excel_units:  all.reduce((a, l) => a + l.excel, 0),
-    ledger_units: all.reduce((a, l) => a + l.ledger, 0),
-    lines: all.filter(l => l.variance !== 0).sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance)),
-  };
-}
-
-/* Full data for one upload — daily arrays plus the stock reconciliation. */
+   The sheet's own figures — milk received, packs made, packs written off —
+   come from the tables they were imported into. Issuing does not: it is read
+   from the movement ledger for the month, because stock leaves the store on
+   an issue note naming a branch, not on the workbook. Closing stock follows
+   from the two together and is worked out here on every read rather than
+   stored, since issuing carries on after the workbook is filed. */
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -127,29 +80,29 @@ router.get('/:id', async (req, res) => {
        WHERE upload_id=$1 ORDER BY product, size, day`, [id]
     );
 
-    const [received, packed, issued, damaged, stock] = await Promise.all([
+    const [received, packed, damaged, stock] = await Promise.all([
       pool.query(
         `SELECT day, farm_litres, mwabulugu_litres, purchased_litres, damaged_litres
          FROM processing_milk_received WHERE upload_id=$1 ORDER BY day`, [id]
       ),
       daily('processing_packed'),
-      daily('processing_issued'),
       daily('processing_damaged'),
       pool.query(
-        `SELECT product, size, opening_units, packed_units, issued_units,
+        `SELECT product, size, opening_units, packed_units,
                 damaged_units, units, litres
          FROM processing_stock WHERE upload_id=$1 ORDER BY product, size`, [id]
       ),
     ]);
 
+    const reconciled = await reconcileUpload(uploadRes.rows[0], stock.rows, { litresFor });
+
     res.json({
       upload:   uploadRes.rows[0],
       received: received.rows,
       packed:   packed.rows,
-      issued:   issued.rows,
+      issued:   reconciled.issued,
       damaged:  damaged.rows,
-      stock:    stock.rows,
-      issued_control: await issuedControlTotal(uploadRes.rows[0], issued.rows),
+      stock:    reconciled.stock,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -237,18 +190,23 @@ router.post('/upload', upload.single('file'), async (req, res) => {
         }
       };
       await insertDaily('processing_packed',  m.packed);
-      await insertDaily('processing_issued',  m.issued);
       await insertDaily('processing_damaged', m.damaged);
 
-      /* ── closing stock, with the movements that produced it ── */
+      /* ── what the sheet accounts for, with the movements that produced it ──
+
+         `units` here is opening + packed − damaged, not the closing balance.
+         The sheet cannot know closing: stock leaves on issue notes raised in
+         the app, which carry on being raised after the month is uploaded.
+         issued_units is stored as zero for the same reason — the column is
+         filled in on read, from the ledger. */
       for (const s of m.stock) {
         await client.query(
           `INSERT INTO processing_stock
              (upload_id, product, size, opening_units, packed_units,
               issued_units, damaged_units, units, litres)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+           VALUES ($1,$2,$3,$4,$5,0,$6,$7,$8)`,
           [uploadId, s.product, s.size, s.opening, s.packed,
-           s.issued, s.damaged, s.closing, s.closing_litres]
+           s.damaged, s.available, s.available_litres]
         );
       }
 
@@ -262,9 +220,8 @@ router.post('/upload', upload.single('file'), async (req, res) => {
           received_litres: Math.round(total(m.received, 'litres') * 10) / 10,
           packed_units:    total(m.packed, 'units'),
           packed_litres:   Math.round(total(m.packed, 'litres') * 10) / 10,
-          issued_units:    total(m.issued, 'units'),
           damaged_units:   total(m.damaged, 'units'),
-          closing_units:   total(m.stock, 'closing'),
+          available_units: total(m.stock, 'available'),
         },
       });
     }

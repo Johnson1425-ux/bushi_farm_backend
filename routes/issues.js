@@ -405,7 +405,12 @@ router.post('/:id/cancel', requireProduction, async (req, res) => {
         reason: 'returned',
         units: Number(it.units),
         litres: Number(it.units) * Number(it.litres_per_pack),
-        occurredOn: req.body?.date || new Date().toISOString().slice(0, 10),
+        /* Dated to the note's own issue date, not today. A month's issued
+           total is read back from these movements, so a return dated into
+           the next month would leave a phantom issue in one month and an
+           unexplained return in the next. Cancelling means the stock never
+           really left: both halves belong on the day it was raised. */
+        occurredOn: issue.issue_date,
         refKind: 'stock_issue', refId: Number(req.params.id),
         notes: 'Dispatch cancelled — stock returned to the processing store',
         createdBy: req.user.id,

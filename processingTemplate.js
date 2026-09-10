@@ -12,10 +12,15 @@
                        the old sheet), plus fresh milk in the tank
      ##RECEIVED##      raw milk in, by source, per day, in litres
      ##PACKED##        packs produced, per product and size, per day
-     ##ISSUED##        packs sent out, per product and size, per day
      ##DAMAGED##       packs written off, per product and size, per day
      ##FRESHDAMAGE##   raw milk lost before packing, per day, in litres
-     ##CLOSING##       opening + packed - issued - damaged, all formulas
+     ##AVAILABLE##     opening + packed - damaged, all formulas
+
+   There is no ISSUED block. Stock leaves the unit on an issue note raised
+   in the app, which records the branch it went to and the day it went —
+   none of which a column of daily totals can say. A sheet that asked for
+   the figure again would give the month two answers and no way to tell
+   which was right.
 
    Column A carries the ##ANCHOR## markers and is hidden. The parser finds
    every section by its anchor rather than by row number, so inserting a
@@ -181,11 +186,14 @@ function buildInstructions(wb) {
     ['OPENING BALANCE — packs and fresh milk carried in from the end of last month (the old "B/D" column).', ''],
     ['MILK RECEIVED — raw milk taken in each day, in litres, split by where it came from.', ''],
     ['PACKED — packs produced each day. This is the old "PROCESSING MILK" / "PROCESSED MILK PACKED" block.', ''],
-    ['ISSUED — packs sent out of the processing unit each day.', ''],
     ['DAMAGED — packs written off each day. This replaces the separate "DAMEGE" sheet.', ''],
     ['FRESH MILK DAMAGED — raw milk lost before it was packed, in litres.', ''],
-    ['CLOSING BALANCE — opening + packed − issued − damaged. Calculated for you; check it against your own', ''],
-    ['   figures before uploading.', ''],
+    ['AVAILABLE — opening + packed − damaged. Calculated for you; check it against your own figures', ''],
+    ['   before uploading.', ''],
+    ['', ''],
+    ['There is no ISSUED section any more. Record stock going out to a branch on the Stock & Issuing', 'head'],
+    ['page instead — it asks which branch, so the app can tell you what each one is holding. Anything', ''],
+    ['you type in an old sheet\'s ISSUED block is ignored on upload.', ''],
     ['', ''],
     ['Litres are worked out from the pack size, so you never type a litre figure for packed goods:', 'head'],
     ['   150ML = 0.15 L    0.5L / CUP / CHUPA / PACK 0.5L = 0.5 L    1L = 1 L    2L = 2 L    3L = 3 L', ''],
@@ -284,10 +292,9 @@ function buildMonthSheet(wb, monthName, year) {
   row = blockTotal(ws, row, recFirst, row - 1, 'GRAND TOTAL', { litres: false });
   row++;
 
-  /* ── PACKED / ISSUED / DAMAGED ── */
+  /* ── PACKED / DAMAGED ── */
   const blocks = [
     ['PACKED', 'PACKED — packs produced, by product and size'],
-    ['ISSUED', 'ISSUED — packs sent out'],
     ['DAMAGED', 'DAMAGED — packs written off'],
   ];
   const blockRows = {};
@@ -321,9 +328,13 @@ function buildMonthSheet(wb, monthName, year) {
     `SUM(${colLetter(DAY_COL_START)}${row}:${colLetter(DAY_COL_START + MAX_DAYS - 1)}${row})`);
   row += 2;
 
-  /* ── CLOSING (all formulas — read by the person, not by the app) ── */
-  anchor(row, 'CLOSING');
-  banner(ws, row, 'CLOSING BALANCE — opening + packed − issued − damaged (calculated)');
+  /* ── AVAILABLE (all formulas — read by the person, not by the app) ──
+
+     Not the closing balance: what is left after issuing is a figure only the
+     app holds, because only the app was told which branch took it. This is
+     everything the unit had to issue from. */
+  anchor(row, 'AVAILABLE');
+  banner(ws, row, 'AVAILABLE — opening + packed − damaged (calculated). Issuing is recorded in the app.');
   row++;
   labelCell(ws, row, 3, 'CATEGORY', { bold: true });
   labelCell(ws, row, DAY_COL_START, 'UNITS', { bold: true });
@@ -338,15 +349,14 @@ function buildMonthSheet(wb, monthName, year) {
     labelCell(ws, row, 3, r.size);
     const open = `${D}${openingFirst + i}`;
     const packed = `${T}${blockRows.PACKED.first + i}`;
-    const issued = `${T}${blockRows.ISSUED.first + i}`;
     const damaged = `${T}${blockRows.DAMAGED.first + i}`;
-    formulaCell(ws, row, DAY_COL_START, `${open}+${packed}-${issued}-${damaged}`);
+    formulaCell(ws, row, DAY_COL_START, `${open}+${packed}-${damaged}`);
     const factor = LITRES_PER_PACK[canonical(r.size)] || 0;
     formulaCell(ws, row, DAY_COL_START + 1, `${D}${row}*${factor}`, '0.00');
     row++;
   });
   const closingFirst = row - PRODUCT_ROWS.length;
-  labelCell(ws, row, 2, 'BALANCE STOCK', { bold: true });
+  labelCell(ws, row, 2, 'AVAILABLE STOCK', { bold: true });
   formulaCell(ws, row, DAY_COL_START, `SUM(${D}${closingFirst}:${D}${row - 1})`);
   formulaCell(ws, row, DAY_COL_START + 1,
     `SUM(${colLetter(DAY_COL_START + 1)}${closingFirst}:${colLetter(DAY_COL_START + 1)}${row - 1})`, '0.00');

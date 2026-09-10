@@ -13,6 +13,7 @@ const aiRoutes         = require('./aiRoutes');
 const { initAiTables }  = require('./aiClient');
 const { initNewTables, initHealthRecordsTables } = require('./lib/initTables');
 const { initStockTables } = require('./lib/initStock');
+const { initPosTables }   = require('./lib/initPos');
 
 /* Route modules — one file per resource, each a plain express.Router().
    Role gates are applied once, here, at the mount point (see the "ROLE
@@ -36,6 +37,7 @@ const branchesRoutes    = require('./routes/branches');
 const productsRoutes    = require('./routes/products');
 const stockRoutes       = require('./routes/stock');
 const issuesRoutes      = require('./routes/issues');
+const posRoutes         = require('./routes/pos');
 
 const app = express();
 
@@ -56,7 +58,10 @@ app.use(express.json());
 
 /* Start the schema work now, so a warm process has it done already. */
 const initAllTables = () => Promise.all([
-  initAiTables(), initNewTables(), initHealthRecordsTables(), initStockTables(),
+  initAiTables(), initNewTables(), initHealthRecordsTables(),
+  /* POS tables reference branches and products, so the stock schema has to
+     be in place before they are created. */
+  initStockTables().then(initPosTables),
 ]);
 ready(initAllTables).catch(err => console.error('DB Init Error:', err.message));
 
@@ -124,6 +129,7 @@ app.use('/api/branches', verifyToken, requireBranchAccess, branchesRoutes);
 app.use('/api/products', verifyToken, requireBranchAccess, productsRoutes);
 app.use('/api/stock',    verifyToken, requireBranchAccess, stockRoutes);
 app.use('/api/issues',   verifyToken, requireBranchAccess, issuesRoutes);
+app.use('/api/pos',      verifyToken, requireBranchAccess, posRoutes);
 
 /* Vet territory. */
 app.use('/api/diseases',       verifyToken, requireHealth, diseasesRoutes);
