@@ -1,6 +1,6 @@
 const express = require('express');
 const { pool } = require('../db');
-const { assertBranchAllowed } = require('../auth');
+const { requireProduction, assertBranchAllowed } = require('../auth');
 const { onHand, postMovements } = require('../lib/stockLedger');
 
 const router = express.Router();
@@ -19,6 +19,14 @@ const router = express.Router();
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const money = (v) => Math.round(num(v) * 100) / 100;
+const TIERS = ['retail', 'wholesale'];
+
+/** The list price for a tier, falling back to retail when wholesale is unset. */
+function tierPrice(product, tier) {
+  const wholesale = num(product.wholesale_price);
+  if (tier === 'wholesale' && wholesale > 0) return wholesale;
+  return num(product.retail_price);
+}
 
 /**
  * The branch this request may act on, or an error to send back.
@@ -85,7 +93,8 @@ async function loadSale(client, id) {
   const { rows } = await client.query(`
     SELECT s.id, s.receipt_no, s.branch_id, b.name AS branch_name,
            TO_CHAR(s.sold_on,'YYYY-MM-DD') AS sold_on, s.sold_at,
-           s.customer_name, s.payment_method, s.subtotal, s.discount, s.total,
+           s.customer_name, s.payment_method, s.price_tier,
+           s.subtotal, s.discount, s.total,
            s.status, s.void_reason, s.voided_at, s.notes,
            c.username AS cashier, v.username AS voided_by
     FROM pos_sales s
@@ -98,7 +107,7 @@ async function loadSale(client, id) {
 
   const { rows: items } = await client.query(`
     SELECT i.id, i.product_id, p.product, p.size, i.units, i.unit_price,
-           i.line_total, i.litres
+           i.line_total, i.litres, i.price_tier
     FROM pos_sale_items i JOIN products p ON p.id = i.product_id
     WHERE i.sale_id = $1 ORDER BY p.sort_order, p.product, p.size
   `, [id]);
@@ -117,20 +126,32 @@ async function loadSale(client, id) {
    really does hold more than the system thinks, the fix is a manager's
    stock adjustment, which leaves a note saying so. */
 router.post('/sales', async (req, res) => {
-  const { branch_id, sold_on, items, customer_name, payment_method = 'cash', discount, notes } = req.body;
+  const { branch_id, sold_on, items, customer_name, payment_method = 'cash',
+          price_tier = 'retail', discount, notes } = req.body;
 
   const scope = resolveBranch(req, branch_id);
   if (scope.error) return res.status(400).json({ error: scope.error });
   const denied = assertBranchAllowed(req, scope.branchId);
   if (denied) return res.status(403).json({ error: denied });
 
+  /* A line may name its own tier — one crate at agent prices alongside a
+     couple of packs over the counter is an ordinary sale here. Anything
+     that does not becomes the sale's tier. */
   const lines = (items || [])
-    .map(i => ({ product_id: parseInt(i.product_id, 10), units: num(i.units), unit_price: i.unit_price }))
+    .map(i => ({
+      product_id: parseInt(i.product_id, 10),
+      units: num(i.units),
+      unit_price: i.unit_price,
+      price_tier: TIERS.includes(i.price_tier) ? i.price_tier : null,
+    }))
     .filter(i => Number.isFinite(i.product_id) && i.units > 0);
   if (!lines.length) return res.status(400).json({ error: 'Add at least one item to the sale' });
 
   if (!['cash', 'mobile', 'card', 'credit'].includes(payment_method)) {
     return res.status(400).json({ error: 'Unknown payment method' });
+  }
+  if (!TIERS.includes(price_tier)) {
+    return res.status(400).json({ error: 'Price tier must be retail or wholesale' });
   }
 
   const day = sold_on || new Date().toISOString().slice(0, 10);
@@ -146,7 +167,8 @@ router.post('/sales', async (req, res) => {
        thing that is certainly correct. */
     const productIds = lines.map(l => l.product_id);
     const { rows: stockRows } = await client.query(`
-      SELECT p.id, p.product, p.size, p.unit_price, p.litres_per_pack, p.active,
+      SELECT p.id, p.product, p.size, p.retail_price, p.wholesale_price,
+             p.litres_per_pack, p.active,
              COALESCE((
                SELECT SUM(m.units) FROM stock_movements m
                WHERE m.product_id = p.id AND m.location_kind = 'branch'
@@ -182,17 +204,22 @@ router.post('/sales', async (req, res) => {
       });
     }
 
-    /* The price is normally the catalogue's. An override is allowed —
-       haggling happens — but it is recorded on the line, never written
-       back to the product. */
+    /* The price is normally the catalogue's, from whichever list this line
+       is being sold on. An override is allowed — haggling happens — but it
+       is recorded on the line, never written back to the product.
+
+       A product with no wholesale price falls back to retail rather than
+       to zero: an unset price is the farm not having got round to it, and
+       giving the pack away is never the safer reading. */
     let subtotal = 0;
     const priced = lines.map(line => {
       const p = byId.get(line.product_id);
+      const tier = line.price_tier || price_tier;
       const unitPrice = line.unit_price != null && num(line.unit_price) >= 0
-        ? money(line.unit_price) : money(p.unit_price);
+        ? money(line.unit_price) : money(tierPrice(p, tier));
       const lineTotal = money(unitPrice * line.units);
       subtotal += lineTotal;
-      return { ...line, unitPrice, lineTotal, perPack: Number(p.litres_per_pack) };
+      return { ...line, tier, unitPrice, lineTotal, perPack: Number(p.litres_per_pack) };
     });
     subtotal = money(subtotal);
 
@@ -202,21 +229,23 @@ router.post('/sales', async (req, res) => {
     const { rows: created } = await client.query(`
       INSERT INTO pos_sales
         (receipt_no, branch_id, sold_on, cashier_id, customer_name,
-         payment_method, subtotal, discount, total, notes)
+         payment_method, price_tier, subtotal, discount, total, notes)
       VALUES (
         'RC-' || TO_CHAR($2::date, 'YYYY') || '-' ||
           LPAD(NEXTVAL('pos_receipt_no_seq')::text, 5, '0'),
-        $1, $2, $3, $4, $5, $6, $7, $8, $9
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
       ) RETURNING id
     `, [scope.branchId, day, req.user.id, customer_name?.trim() || null,
-        payment_method, subtotal, disc, total, notes?.trim() || null]);
+        payment_method, price_tier, subtotal, disc, total, notes?.trim() || null]);
     const saleId = created[0].id;
 
     for (const l of priced) {
       await client.query(`
-        INSERT INTO pos_sale_items (sale_id, product_id, units, unit_price, line_total, litres)
-        VALUES ($1,$2,$3,$4,$5,$6)
-      `, [saleId, l.product_id, l.units, l.unitPrice, l.lineTotal, l.units * l.perPack]);
+        INSERT INTO pos_sale_items
+          (sale_id, product_id, units, unit_price, line_total, litres, price_tier)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `, [saleId, l.product_id, l.units, l.unitPrice, l.lineTotal,
+          l.units * l.perPack, l.tier]);
     }
 
     await postMovements(client, priced.map(l => ({
@@ -240,7 +269,7 @@ router.post('/sales', async (req, res) => {
 
 /* ── receipts ────────────────────────────────────────────── */
 router.get('/sales', async (req, res) => {
-  const { from, to, status, payment_method } = req.query;
+  const { from, to, status, payment_method, price_tier, product_id } = req.query;
   const conditions = [], params = [];
 
   const scope = listScope(req, req.query.branch_id);
@@ -252,6 +281,15 @@ router.get('/sales', async (req, res) => {
   if (to)     { params.push(to);     conditions.push(`s.sold_on <= $${params.length}`); }
   if (status) { params.push(status); conditions.push(`s.status = $${params.length}`); }
   if (payment_method) { params.push(payment_method); conditions.push(`s.payment_method = $${params.length}`); }
+  if (price_tier)     { params.push(price_tier);     conditions.push(`s.price_tier = $${params.length}`); }
+  /* Filtering by product keeps whole receipts rather than trimming them to
+     the matching line: a receipt is the unit a person reads, and one showing
+     a total that excluded half its items would be worse than useless. */
+  if (product_id) {
+    params.push(product_id);
+    conditions.push(`EXISTS (SELECT 1 FROM pos_sale_items i
+                             WHERE i.sale_id = s.id AND i.product_id = $${params.length})`);
+  }
 
   const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
   const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
@@ -260,7 +298,8 @@ router.get('/sales', async (req, res) => {
     const { rows } = await pool.query(`
       SELECT s.id, s.receipt_no, s.branch_id, b.name AS branch_name,
              TO_CHAR(s.sold_on,'YYYY-MM-DD') AS sold_on, s.sold_at,
-             s.customer_name, s.payment_method, s.subtotal, s.discount, s.total,
+             s.customer_name, s.payment_method, s.price_tier,
+             s.subtotal, s.discount, s.total,
              s.status, c.username AS cashier,
              COALESCE(agg.units, 0)  AS units,
              COALESCE(agg.litres, 0) AS litres,
@@ -361,12 +400,237 @@ router.post('/sales/:id/void', async (req, res) => {
   } finally { client.release(); }
 });
 
+/* ══════════════════════════════════════════════════════════════
+   CASH-UP
+
+   The attendant's end of the day. Everything the receipts already know is
+   read back rather than typed: sales, what was taken in cash, on mobile,
+   on card, and what went out on credit. What a person has to supply is
+   only what no receipt records — money collected against an old debt,
+   money taken in advance, cash paid out of the drawer, and what was
+   actually counted at closing.
+
+     expected = cash sales + debtor receipts + prepaids - expenses
+     variance = counted - expected
+
+   Credit sales never enter it: no money changed hands. Mobile and card
+   are shown but not expected in the drawer, because they are not in it.
+══════════════════════════════════════════════════════════════ */
+
+/** The day's takings, split the way a cash-up needs them. */
+async function daySales(client, branchId, day) {
+  const { rows } = await client.query(`
+    SELECT
+      ROUND(COALESCE(SUM(total), 0)::numeric, 2)                                          AS sales,
+      ROUND(COALESCE(SUM(total) FILTER (WHERE payment_method = 'cash'), 0)::numeric, 2)   AS cash_sales,
+      ROUND(COALESCE(SUM(total) FILTER (WHERE payment_method = 'mobile'), 0)::numeric, 2) AS mobile_sales,
+      ROUND(COALESCE(SUM(total) FILTER (WHERE payment_method = 'card'), 0)::numeric, 2)   AS card_sales,
+      ROUND(COALESCE(SUM(total) FILTER (WHERE payment_method = 'credit'), 0)::numeric, 2) AS credit_sales,
+      ROUND(COALESCE(SUM(discount), 0)::numeric, 2)                                       AS discounts,
+      COUNT(*)::int                                                                        AS receipts
+    FROM pos_sales
+    WHERE branch_id = $1 AND sold_on = $2 AND status = 'completed'
+  `, [branchId, day]);
+  const r = rows[0];
+  return {
+    sales: num(r.sales), cash_sales: num(r.cash_sales),
+    mobile_sales: num(r.mobile_sales), card_sales: num(r.card_sales),
+    credit_sales: num(r.credit_sales), discounts: num(r.discounts),
+    receipts: r.receipts,
+  };
+}
+
+/**
+ * A branch's cash-up for one day, whether or not one has been started.
+ *
+ * A day nobody has touched still comes back — with the takings filled in
+ * and the entered figures at zero — so the attendant opens a form that is
+ * already most of the way done rather than a blank one.
+ */
+async function loadCashUp(client, branchId, day) {
+  const { rows } = await client.query(`
+    SELECT c.*, TO_CHAR(c.business_day,'YYYY-MM-DD') AS business_day,
+           b.name AS branch_name,
+           cb.username AS closed_by_name, cr.username AS created_by_name
+    FROM pos_cash_ups c
+    JOIN branches b ON b.id = c.branch_id
+    LEFT JOIN users cb ON cb.id = c.closed_by
+    LEFT JOIN users cr ON cr.id = c.created_by
+    WHERE c.branch_id = $1 AND c.business_day = $2
+  `, [branchId, day]);
+
+  const takings = await daySales(client, branchId, day);
+  const record = rows[0] || null;
+
+  let expenses = [];
+  if (record) {
+    const e = await client.query(
+      'SELECT id, description, amount FROM pos_cash_up_expenses WHERE cash_up_id = $1 ORDER BY id',
+      [record.id]
+    );
+    expenses = e.rows.map(x => ({ ...x, amount: num(x.amount) }));
+  }
+
+  const expenseTotal = expenses.reduce((a, x) => a + x.amount, 0);
+  const entered = {
+    debtor_receipts: num(record?.debtor_receipts),
+    prepaids:        num(record?.prepaids),
+    counted_cash:    num(record?.counted_cash),
+    mobile_counted:  num(record?.mobile_counted),
+    bank_deposit:    num(record?.bank_deposit),
+    float_retained:  num(record?.float_retained),
+  };
+
+  const expected = money(
+    takings.cash_sales + entered.debtor_receipts + entered.prepaids - expenseTotal
+  );
+
+  return {
+    branch_id: branchId,
+    branch_name: record?.branch_name || null,
+    business_day: day,
+    status: record?.status || 'open',
+    exists: !!record,
+    id: record?.id || null,
+    notes: record?.notes || null,
+    closed_by: record?.closed_by_name || null,
+    closed_at: record?.closed_at || null,
+    takings,
+    expenses,
+    expense_total: money(expenseTotal),
+    ...entered,
+    expected_cash: expected,
+    variance: money(entered.counted_cash - expected),
+  };
+}
+
+/* GET the cash-up for a day — defaults to today at the caller's branch. */
+router.get('/cash-up', async (req, res) => {
+  const scope = resolveBranch(req, req.query.branch_id);
+  if (scope.error) return res.status(400).json({ error: scope.error });
+  const denied = assertBranchAllowed(req, scope.branchId);
+  if (denied) return res.status(403).json({ error: denied });
+
+  const day = req.query.date || new Date().toISOString().slice(0, 10);
+  try {
+    res.json(await loadCashUp(pool, scope.branchId, day));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* Save or close it.
+
+   Saving is repeatable while the day is open — an attendant records an
+   expense when it happens rather than trying to remember it all at
+   closing. Closing is the signature, and a closed day is not editable by
+   the attendant who closed it: reopening is a manager's call, so that the
+   count someone signed for cannot quietly become a different one. */
+router.post('/cash-up', async (req, res) => {
+  const scope = resolveBranch(req, req.body.branch_id);
+  if (scope.error) return res.status(400).json({ error: scope.error });
+  const denied = assertBranchAllowed(req, scope.branchId);
+  if (denied) return res.status(403).json({ error: denied });
+
+  const day = req.body.date || new Date().toISOString().slice(0, 10);
+  const close = req.body.close === true;
+
+  const expenses = (req.body.expenses || [])
+    .map(e => ({ description: String(e.description || '').trim(), amount: money(e.amount) }))
+    .filter(e => e.amount > 0);
+  if (expenses.some(e => !e.description)) {
+    return res.status(400).json({ error: 'Every expense needs a description' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: existing } = await client.query(
+      'SELECT id, status FROM pos_cash_ups WHERE branch_id=$1 AND business_day=$2 FOR UPDATE',
+      [scope.branchId, day]
+    );
+
+    if (existing[0]?.status === 'closed' && req.user.role === 'attendant') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'This day is already closed. A manager can reopen it if the count was wrong.',
+      });
+    }
+
+    const fields = [
+      scope.branchId, day,
+      money(req.body.debtor_receipts), money(req.body.prepaids),
+      money(req.body.counted_cash), money(req.body.mobile_counted),
+      money(req.body.bank_deposit), money(req.body.float_retained),
+      req.body.notes?.trim() || null,
+      req.user.id,
+    ];
+
+    const { rows: saved } = await client.query(`
+      INSERT INTO pos_cash_ups
+        (branch_id, business_day, debtor_receipts, prepaids, counted_cash,
+         mobile_counted, bank_deposit, float_retained, notes, created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (branch_id, business_day) DO UPDATE SET
+        debtor_receipts = EXCLUDED.debtor_receipts,
+        prepaids        = EXCLUDED.prepaids,
+        counted_cash    = EXCLUDED.counted_cash,
+        mobile_counted  = EXCLUDED.mobile_counted,
+        bank_deposit    = EXCLUDED.bank_deposit,
+        float_retained  = EXCLUDED.float_retained,
+        notes           = EXCLUDED.notes,
+        updated_at      = NOW()
+      RETURNING id
+    `, fields);
+    const cashUpId = saved[0].id;
+
+    /* The expense list is replaced wholesale rather than merged: the form
+       sends the day's list as it now stands, and a line the attendant
+       deleted has to actually go. */
+    await client.query('DELETE FROM pos_cash_up_expenses WHERE cash_up_id = $1', [cashUpId]);
+    for (const e of expenses) {
+      await client.query(
+        'INSERT INTO pos_cash_up_expenses (cash_up_id, description, amount) VALUES ($1,$2,$3)',
+        [cashUpId, e.description, e.amount]
+      );
+    }
+
+    if (close) {
+      await client.query(
+        `UPDATE pos_cash_ups SET status='closed', closed_by=$1, closed_at=NOW() WHERE id=$2`,
+        [req.user.id, cashUpId]
+      );
+    }
+
+    const result = await loadCashUp(client, scope.branchId, day);
+    await client.query('COMMIT');
+    res.status(201).json(result);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+/* Reopen a closed day. A manager's call, and it says who reopened it by
+   clearing the signature rather than keeping a stale one. */
+router.post('/cash-up/:id/reopen', requireProduction, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE pos_cash_ups SET status='open', closed_by=NULL, closed_at=NULL, updated_at=NOW()
+       WHERE id=$1 AND status='closed'
+       RETURNING branch_id, TO_CHAR(business_day,'YYYY-MM-DD') AS business_day`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(409).json({ error: 'That day is not closed' });
+    res.json(await loadCashUp(pool, rows[0].branch_id, rows[0].business_day));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 /* ── takings ─────────────────────────────────────────────────
    Voided receipts are excluded from every figure here. They are money
    that was never taken, and leaving them in would overstate a day the
    attendant already knows was corrected. */
 router.get('/summary', async (req, res) => {
-  const { from, to } = req.query;
+  const { from, to, payment_method, price_tier, product_id } = req.query;
   const conditions = [`s.status = 'completed'`], params = [];
 
   const scope = listScope(req, req.query.branch_id);
@@ -376,10 +640,17 @@ router.get('/summary', async (req, res) => {
   }
   if (from) { params.push(from); conditions.push(`s.sold_on >= $${params.length}`); }
   if (to)   { params.push(to);   conditions.push(`s.sold_on <= $${params.length}`); }
+  if (payment_method) { params.push(payment_method); conditions.push(`s.payment_method = $${params.length}`); }
+  if (price_tier)     { params.push(price_tier);     conditions.push(`s.price_tier = $${params.length}`); }
+  if (product_id) {
+    params.push(product_id);
+    conditions.push(`EXISTS (SELECT 1 FROM pos_sale_items i
+                             WHERE i.sale_id = s.id AND i.product_id = $${params.length})`);
+  }
   const where = 'WHERE ' + conditions.join(' AND ');
 
   try {
-    const [byMonth, byBranch, byProduct, totals] = await Promise.all([
+    const [byMonth, byBranch, byPayment, byProduct, totals] = await Promise.all([
       pool.query(`
         SELECT TO_CHAR(s.sold_on,'YYYY-MM') AS month,
                COUNT(*)::int AS receipts,
@@ -394,6 +665,14 @@ router.get('/summary', async (req, res) => {
                ROUND(SUM(s.total)::numeric, 2) AS revenue
         FROM pos_sales s JOIN branches b ON b.id = s.branch_id ${where}
         GROUP BY b.id, b.name ORDER BY revenue DESC NULLS LAST
+      `, params),
+      pool.query(`
+        SELECT s.payment_method, s.price_tier,
+               COUNT(*)::int AS receipts,
+               ROUND(SUM(s.total)::numeric, 2) AS revenue
+        FROM pos_sales s ${where}
+        GROUP BY s.payment_method, s.price_tier
+        ORDER BY revenue DESC NULLS LAST
       `, params),
       pool.query(`
         SELECT p.product, p.size,
@@ -427,6 +706,7 @@ router.get('/summary', async (req, res) => {
     res.json({
       by_month:   byMonth.rows,
       by_branch:  byBranch.rows,
+      by_payment: byPayment.rows,
       by_product: byProduct.rows,
       totals:     totals.rows[0],
     });
