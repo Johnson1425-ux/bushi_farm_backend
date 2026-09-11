@@ -366,18 +366,18 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
    still have taken very little money, which is exactly the reading this
    is here to make possible. */
 
-async function debtorsContext({ from, to }) {
+async function customersContext({ from, to }) {
   const [movement, outstanding] = await Promise.all([
     pool.query(`
       SELECT ROUND(COALESCE(SUM(amount) FILTER (WHERE kind = 'charge'), 0)::numeric, 2)   AS charged,
              ROUND(COALESCE(SUM(-amount) FILTER (WHERE kind = 'payment'), 0)::numeric, 2) AS collected
-      FROM debtor_entries WHERE entry_date BETWEEN $1 AND $2
+      FROM customer_entries WHERE entry_date BETWEEN $1 AND $2
     `, [from, to]),
     pool.query(`
       WITH balances AS (
         SELECT d.name,
                d.opening_balance + COALESCE(SUM(e.amount) FILTER (WHERE e.entry_date <= $1), 0) AS balance
-        FROM debtors d LEFT JOIN debtor_entries e ON e.debtor_id = d.id
+        FROM customers d LEFT JOIN customer_entries e ON e.customer_id = d.id
         GROUP BY d.id
       )
       SELECT ROUND(COALESCE(SUM(balance) FILTER (WHERE balance > 0), 0)::numeric, 2)  AS owed,
@@ -984,7 +984,7 @@ async function farmSnapshot({ from, to } = {}) {
       healthContext(period),
       pregnancyContext(period),
       salesContext(period),
-      debtorsContext(period),
+      customersContext(period),
       inventoryContext(period),
       processingContext(),
     ]);
@@ -1000,7 +1000,7 @@ module.exports = {
   healthContext,
   pregnancyContext,
   salesContext,
-  debtorsContext,
+  customersContext,
   inventoryContext,
   processingContext,
   processingMonth,

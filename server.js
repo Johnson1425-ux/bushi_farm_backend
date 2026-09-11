@@ -14,7 +14,7 @@ const { initAiTables }  = require('./aiClient');
 const { initNewTables, initHealthRecordsTables } = require('./lib/initTables');
 const { initStockTables } = require('./lib/initStock');
 const { initPosTables }   = require('./lib/initPos');
-const { initDebtorTables } = require('./lib/initDebtors');
+const { initCustomerTables } = require('./lib/initCustomers');
 
 /* Route modules — one file per resource, each a plain express.Router().
    Role gates are applied once, here, at the mount point (see the "ROLE
@@ -40,7 +40,7 @@ const stockRoutes       = require('./routes/stock');
 const issuesRoutes      = require('./routes/issues');
 const posRoutes         = require('./routes/pos');
 const reportsRoutes     = require('./routes/reports');
-const { router: debtorsRoutes } = require('./routes/debtors');
+const { router: customersRoutes } = require('./routes/customers');
 
 const app = express();
 
@@ -65,8 +65,8 @@ const initAllTables = () => Promise.all([
   /* POS tables reference branches and products, so the stock schema has to
      be in place before they are created. */
   /* Each step depends on the tables the one before it creates: POS
-     references branches and products, debtors references pos_sales. */
-  initStockTables().then(initPosTables).then(initDebtorTables),
+     references branches and products, customers references pos_sales. */
+  initStockTables().then(initPosTables).then(initCustomerTables),
 ]);
 ready(initAllTables).catch(err => console.error('DB Init Error:', err.message));
 
@@ -135,10 +135,10 @@ app.use('/api/products', verifyToken, requireBranchAccess, productsRoutes);
 app.use('/api/stock',    verifyToken, requireBranchAccess, stockRoutes);
 app.use('/api/issues',   verifyToken, requireBranchAccess, issuesRoutes);
 app.use('/api/pos',      verifyToken, requireBranchAccess, posRoutes);
-/* An attendant rings up credit sales and takes payments over the counter,
-   so the book is theirs to read and add to; writing off a balance is gated
-   inside the router. */
-app.use('/api/debtors',  verifyToken, requireBranchAccess, debtorsRoutes);
+/* An attendant names the customer on every sale and takes payments over
+   the counter, so the book is theirs to read and add to; writing off a
+   balance is gated inside the router. */
+app.use('/api/customers', verifyToken, requireBranchAccess, customersRoutes);
 
 /* Reports span every branch and are management's view of the business, so
    they stay in manager territory rather than following the branch gate
