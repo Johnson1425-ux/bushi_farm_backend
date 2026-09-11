@@ -176,7 +176,8 @@ their figures. Flag thin sample sizes rather than reading trends into them.
 ## Herd health
 Diseases recorded, treatments given, and veterinary findings. Connect health
 events to production changes where the dates line up — and say plainly when they
-do not line up rather than implying a link.
+do not line up rather than implying a link. Where examinations in the period
+carry recommendations, gather the ones still outstanding.
 
 ## Breeding
 Births in the period, new conceptions, and pregnancies due soon. Include the
@@ -459,8 +460,11 @@ deviation — a high spread means erratic yield, which is itself worth flagging.
 ## Health record
 Diseases, treatments, and veterinary examination findings in date order. Include
 clinical values (temperature, pulse, body weight, PCV) where they were recorded
-and say whether they sit inside normal bovine ranges. Note any milk withdrawal
-dates that are still in effect.
+and say whether they sit inside normal bovine ranges. Where an examination
+recorded a major complaint, significant findings or a recommendation, carry the
+vet's own words rather than paraphrasing the diagnosis over them, and say
+whether their recommendation still stands. Note any milk withdrawal dates that
+are still in effect.
 
 ## Breeding record
 Conceptions, expected due dates, and births. If she is currently pregnant, give

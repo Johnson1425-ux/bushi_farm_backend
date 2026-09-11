@@ -14,10 +14,42 @@
 const { pool } = require('./db');
 const { applyIssued, ledgerIssuedDaily } = require('./lib/processingReconcile');
 const { litresFor } = require('./processingCatalog');
+const { COLUMNS: HEALTH_RECORD_COLUMNS } = require('./lib/healthRecordForm');
 
 /* ── helpers ─────────────────────────────────────────────── */
 
 const num = (v) => (v === null || v === undefined ? null : Number(v));
+
+/**
+ * A row with its blanks dropped.
+ *
+ * The context is handed to the model as pretty-printed JSON, so a field
+ * nobody filled in costs the same prompt space as one that carries a
+ * finding — and an examination sheet is mostly blanks by design. Dropping
+ * them is what lets a health record be sent whole without the payload
+ * growing to match: what is left is what the vet actually recorded.
+ */
+const isBlank = (v) =>
+  v === null || v === undefined || v === '' ||
+  (Array.isArray(v) && v.length === 0);
+
+const compact = (row) => Object.fromEntries(
+  Object.entries(row)
+    .filter(([, v]) => !isBlank(v))
+    /* Findings and prescriptions are rows inside the record, and a
+       "Normal" system with nothing written beside it carries a blank
+       observation of its own. Pruning stops at that depth — one level of
+       rows is as deep as anything in this file nests. */
+    .map(([k, v]) => [
+      k,
+      Array.isArray(v)
+        ? v.map(item =>
+            item && typeof item === 'object' && !Array.isArray(item)
+              ? Object.fromEntries(Object.entries(item).filter(([, x]) => !isBlank(x)))
+              : item)
+        : v,
+    ])
+);
 /* Same, but for arithmetic: a missing figure is zero, never NaN. */
 const num0 = (v) => {
   const n = Number(v);
@@ -185,10 +217,17 @@ async function healthContext({ from, to }) {
 
     // cow_health_records stores exam_date as free text, so filter on the
     // upload timestamp instead — it is the only reliable ordering we have.
+    //
+    // What each examination concluded, not how it got there: across sixty
+    // animals the complaint, the findings, the diagnosis and what the vet
+    // advised are what a herd report reasons about. The vitals and the lab
+    // panel belong to one animal's history, and cowContext sends those in
+    // full.
     pool.query(`
-      SELECT r.cow_tag, r.breed, r.exam_date,
+      SELECT r.cow_tag, r.breed, r.sex, r.repro_status, r.exam_date,
+             r.present_illness, r.significant_findings,
              r.tentative_diagnosis, r.final_diagnosis,
-             r.attending_vet, r.milk_withdraw_date,
+             r.recommendation, r.attending_vet, r.milk_withdraw_date,
              c.name AS cow_name
       FROM cow_health_records r
       LEFT JOIN cows c ON c.id = r.cow_id
@@ -210,7 +249,7 @@ async function healthContext({ from, to }) {
   return {
     diseases:   diseases.rows,
     treatments: treatments.rows,
-    vet_records: records.rows,
+    vet_records: records.rows.map(compact),
     cow_events: history.rows,
   };
 }
@@ -781,11 +820,14 @@ async function cowDossier(cowId) {
         FROM cow_history WHERE cow_id = $1 ORDER BY date DESC LIMIT 50
       `, [cowId]),
 
+      /* The examination sheet in full, for this one animal.
+         The column list comes from the form's own catalogue rather than
+         being written out here, because a hand-kept list is what left this
+         query short of the vet's major complaint, significant findings and
+         recommendation after those were added to the form. Ten records of
+         it stay small because compact() drops what the vet left blank. */
       pool.query(`
-        SELECT exam_date, age, parity, body_weight, body_temperature, pulse_rate,
-               respiratory_rate, days_in_milk, daily_milk_yield, present_illness,
-               clinical_findings, tentative_diagnosis, final_diagnosis,
-               lab_findings, treatments, milk_withdraw_date, attending_vet
+        SELECT ${HEALTH_RECORD_COLUMNS.join(', ')}
         FROM cow_health_records WHERE cow_id = $1
         ORDER BY uploaded_at DESC LIMIT 10
       `, [cowId]),
@@ -823,7 +865,7 @@ async function cowDossier(cowId) {
     treatments: treatments.rows,
     pregnancies: pregnancies.rows,
     events: history.rows,
-    vet_records: vet.rows,
+    vet_records: vet.rows.map(compact),
   };
 }
 
