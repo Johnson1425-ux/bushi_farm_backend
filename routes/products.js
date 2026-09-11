@@ -16,7 +16,7 @@ router.get('/', async (req, res) => {
   const where = req.query.active === 'true' ? 'WHERE active' : '';
   try {
     const { rows } = await pool.query(`
-      SELECT id, product, size, litres_per_pack,
+      SELECT id, product, size, litres_per_pack, sold_by,
              retail_price, wholesale_price, active, sort_order
       FROM products ${where} ORDER BY sort_order, product, size
     `);
@@ -45,7 +45,7 @@ router.patch('/:id', requireProduction, async (req, res) => {
          wholesale_price = COALESCE($2, wholesale_price),
          active          = COALESCE($3, active)
        WHERE id = $4
-       RETURNING id, product, size, litres_per_pack,
+       RETURNING id, product, size, litres_per_pack, sold_by,
                  retail_price, wholesale_price, active, sort_order`,
       [retail_price    != null ? Number(retail_price)    : null,
        wholesale_price != null ? Number(wholesale_price) : null,
@@ -55,6 +55,49 @@ router.patch('/:id', requireProduction, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Product not found' });
     res.json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* Add a line the processing catalogue does not define.
+
+   This exists for milk sold loose from the churn: the catalogue describes
+   what the unit packs, and fresh milk by the litre is not packed at all.
+   Sealed products still come from processingCatalog.js, so the parser and
+   the template cannot drift from what the till sells.
+
+   A litre line is stored with litres_per_pack of 1, which is what makes
+   the rest of the system work unchanged: a "unit" in the stock ledger
+   simply is a litre, so bulk milk is issued, sold, counted and reported
+   through exactly the same path as a bottle. */
+router.post('/', requireProduction, async (req, res) => {
+  const { product, size, sold_by = 'litre', retail_price, wholesale_price } = req.body;
+  if (!product || !String(product).trim()) return res.status(400).json({ error: 'product required' });
+  if (!['pack', 'litre'].includes(sold_by)) {
+    return res.status(400).json({ error: 'sold_by must be pack or litre' });
+  }
+  if (sold_by === 'pack') {
+    return res.status(400).json({
+      error: 'Sealed products are defined in the processing catalogue, not added here — '
+           + 'adding one here would leave the workbook template and the parser unaware of it.',
+    });
+  }
+
+  const label = String(size || 'LITRE').trim().toUpperCase();
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO products (product, size, litres_per_pack, sold_by,
+                             retail_price, wholesale_price, sort_order)
+       VALUES ($1,$2,1,$3,$4,$5, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM products))
+       RETURNING id, product, size, litres_per_pack, sold_by,
+                 retail_price, wholesale_price, active, sort_order`,
+      [String(product).trim().toUpperCase(), label, sold_by,
+       Number(retail_price) >= 0 ? Number(retail_price) : 0,
+       Number(wholesale_price) >= 0 ? Number(wholesale_price) : 0]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That product and size already exists' });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

@@ -257,42 +257,151 @@ async function pregnancyContext({ from, to }) {
   };
 }
 
-/* ── sales ───────────────────────────────────────────────── */
+/* ── sales ─────────────────────────────────────────────────
+
+   Revenue comes from the till. Before there was one, bulk milk was kept
+   by hand in the `sales` table; those rows are still reported for periods
+   that have them, labelled as what they are, so a report on an old month
+   does not come back empty. Nothing writes to that table any more — see
+   routes/sales.js.
+
+   Voided receipts are excluded throughout: money that was never taken. */
 
 async function salesContext({ from, to, prevFrom, prevTo }) {
   const totalsSql = `
-    SELECT COUNT(*)::int                                   AS entries,
-           ROUND(SUM(litres_sold)::numeric, 1)             AS litres_sold,
-           ROUND(SUM(litres_sold * price_per_litre)::numeric, 2) AS revenue,
-           ROUND(AVG(price_per_litre)::numeric, 2)         AS avg_price_per_litre
-    FROM sales WHERE date BETWEEN $1 AND $2
+    WITH selected AS (
+      SELECT id, total, discount, payment_method
+      FROM pos_sales WHERE status = 'completed' AND sold_on BETWEEN $1 AND $2
+    )
+    SELECT COUNT(*)::int                                    AS receipts,
+           ROUND(COALESCE(SUM(total), 0)::numeric, 2)       AS revenue,
+           ROUND(COALESCE(SUM(discount), 0)::numeric, 2)    AS discounts,
+           ROUND(COALESCE(AVG(total), 0)::numeric, 2)       AS avg_receipt,
+           ROUND(COALESCE(SUM(total) FILTER (WHERE payment_method = 'credit'), 0)::numeric, 2) AS credit_sales,
+           ROUND(COALESCE((
+             SELECT SUM(i.litres) FROM pos_sale_items i WHERE i.sale_id IN (SELECT id FROM selected)
+           ), 0)::numeric, 1) AS litres_sold
+    FROM selected
   `;
 
-  const [totals, prevTotals, daily] = await Promise.all([
+  const [totals, prevTotals, daily, byBranch, byTier, legacy] = await Promise.all([
     pool.query(totalsSql, [from, to]),
     pool.query(totalsSql, [prevFrom, prevTo]),
     pool.query(`
-      SELECT TO_CHAR(date, 'YYYY-MM-DD')                          AS date,
-             ROUND(SUM(litres_sold)::numeric, 1)                  AS litres_sold,
-             ROUND(SUM(litres_sold * price_per_litre)::numeric, 2) AS revenue
+      SELECT TO_CHAR(s.sold_on, 'YYYY-MM-DD')          AS date,
+             ROUND(SUM(s.total)::numeric, 2)           AS revenue,
+             COUNT(*)::int                             AS receipts
+      FROM pos_sales s
+      WHERE s.status = 'completed' AND s.sold_on BETWEEN $1 AND $2
+      GROUP BY 1 ORDER BY 1
+    `, [from, to]),
+    pool.query(`
+      SELECT b.name AS branch,
+             ROUND(SUM(s.total)::numeric, 2) AS revenue,
+             COUNT(*)::int                   AS receipts
+      FROM pos_sales s JOIN branches b ON b.id = s.branch_id
+      WHERE s.status = 'completed' AND s.sold_on BETWEEN $1 AND $2
+      GROUP BY b.id, b.name ORDER BY revenue DESC NULLS LAST
+    `, [from, to]),
+    /* Counter trade against agent trade. The same pack sells on two price
+       lists, so one revenue figure cannot say which the period was. */
+    pool.query(`
+      SELECT i.price_tier,
+             SUM(i.units)                          AS units,
+             ROUND(SUM(i.litres)::numeric, 1)      AS litres,
+             ROUND(SUM(i.line_total)::numeric, 2)  AS revenue
+      FROM pos_sales s JOIN pos_sale_items i ON i.sale_id = s.id
+      WHERE s.status = 'completed' AND s.sold_on BETWEEN $1 AND $2
+      GROUP BY i.price_tier
+    `, [from, to]),
+    pool.query(`
+      SELECT COUNT(*)::int                                          AS entries,
+             ROUND(COALESCE(SUM(litres_sold), 0)::numeric, 1)       AS litres_sold,
+             ROUND(COALESCE(SUM(litres_sold * price_per_litre), 0)::numeric, 2) AS revenue
       FROM sales WHERE date BETWEEN $1 AND $2
-      GROUP BY date ORDER BY date
     `, [from, to]),
   ]);
 
   const shape = (r) => ({
-    entries: r.entries,
+    receipts: r.receipts,
     litres_sold: num(r.litres_sold),
     revenue: num(r.revenue),
-    avg_price_per_litre: num(r.avg_price_per_litre),
+    discounts: num(r.discounts),
+    avg_receipt: num(r.avg_receipt),
+    credit_sales: num(r.credit_sales),
   });
 
-  return {
+  const out = {
+    note: 'Revenue is what the branch tills rang up, net of voided receipts. '
+        + 'Credit sales are included in revenue but no money was taken for them — '
+        + 'see debtors for what is still owed.',
     totals: shape(totals.rows[0]),
     previous_period: shape(prevTotals.rows[0]),
-    daily: daily.rows.map(r => ({
-      date: r.date, litres_sold: num(r.litres_sold), revenue: num(r.revenue),
+    by_branch: byBranch.rows.map(r => ({ branch: r.branch, revenue: num(r.revenue), receipts: r.receipts })),
+    by_price_list: byTier.rows.map(r => ({
+      price_list: r.price_tier, units: num(r.units), litres: num(r.litres), revenue: num(r.revenue),
     })),
+    daily: daily.rows.map(r => ({ date: r.date, revenue: num(r.revenue), receipts: r.receipts })),
+  };
+
+  /* Only when the period actually has hand-kept rows. Reporting a block of
+     zeroes for every month since the till went in would read as a decline
+     that never happened. */
+  const old = legacy.rows[0];
+  if (old.entries > 0) {
+    out.legacy_bulk_milk = {
+      note: 'Bulk milk recorded by hand before branch tills existed. Not part of the '
+          + 'totals above, and nothing has been added to it since.',
+      entries: old.entries,
+      litres_sold: num(old.litres_sold),
+      revenue: num(old.revenue),
+    };
+  }
+
+  return out;
+}
+
+/* ── debtors ───────────────────────────────────────────────
+   What credit sales left behind. A period can look strong on revenue and
+   still have taken very little money, which is exactly the reading this
+   is here to make possible. */
+
+async function debtorsContext({ from, to }) {
+  const [movement, outstanding] = await Promise.all([
+    pool.query(`
+      SELECT ROUND(COALESCE(SUM(amount) FILTER (WHERE kind = 'charge'), 0)::numeric, 2)   AS charged,
+             ROUND(COALESCE(SUM(-amount) FILTER (WHERE kind = 'payment'), 0)::numeric, 2) AS collected
+      FROM debtor_entries WHERE entry_date BETWEEN $1 AND $2
+    `, [from, to]),
+    pool.query(`
+      WITH balances AS (
+        SELECT d.name,
+               d.opening_balance + COALESCE(SUM(e.amount) FILTER (WHERE e.entry_date <= $1), 0) AS balance
+        FROM debtors d LEFT JOIN debtor_entries e ON e.debtor_id = d.id
+        GROUP BY d.id
+      )
+      SELECT ROUND(COALESCE(SUM(balance) FILTER (WHERE balance > 0), 0)::numeric, 2)  AS owed,
+             ROUND(COALESCE(SUM(balance) FILTER (WHERE balance < 0), 0)::numeric, 2)  AS in_credit,
+             COUNT(*) FILTER (WHERE balance > 0)::int                                 AS accounts_owing,
+             COALESCE(JSON_AGG(JSON_BUILD_OBJECT('name', name, 'balance', ROUND(balance::numeric, 2)))
+               FILTER (WHERE balance > 0), '[]') AS accounts
+      FROM balances
+    `, [to]),
+  ]);
+
+  const o = outstanding.rows[0];
+  const biggest = (o.accounts || [])
+    .map(a => ({ ...a, balance: num(a.balance) }))
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 10);
+
+  return {
+    charged_in_period: num(movement.rows[0].charged),
+    collected_in_period: num(movement.rows[0].collected),
+    outstanding_at_end: num(o.owed),
+    paid_in_advance_at_end: num(o.in_credit),
+    accounts_owing: o.accounts_owing,
+    largest_balances: biggest,
   };
 }
 
@@ -869,17 +978,18 @@ async function alertSignals() {
 async function farmSnapshot({ from, to } = {}) {
   const period = resolvePeriod(from, to);
 
-  const [production, health, pregnancies, sales, inventory, processing] =
+  const [production, health, pregnancies, sales, debtors, inventory, processing] =
     await Promise.all([
       productionContext(period),
       healthContext(period),
       pregnancyContext(period),
       salesContext(period),
+      debtorsContext(period),
       inventoryContext(period),
       processingContext(),
     ]);
 
-  return { period, production, health, pregnancies, sales, inventory, processing };
+  return { period, production, health, pregnancies, sales, debtors, inventory, processing };
 }
 
 module.exports = {
@@ -890,6 +1000,7 @@ module.exports = {
   healthContext,
   pregnancyContext,
   salesContext,
+  debtorsContext,
   inventoryContext,
   processingContext,
   processingMonth,

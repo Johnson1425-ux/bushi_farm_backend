@@ -2,6 +2,7 @@ const express = require('express');
 const { pool } = require('../db');
 const { requireProduction, assertBranchAllowed } = require('../auth');
 const { onHand, postMovements } = require('../lib/stockLedger');
+const { findOrCreateDebtor } = require('./debtors');
 
 const router = express.Router();
 
@@ -93,12 +94,14 @@ async function loadSale(client, id) {
   const { rows } = await client.query(`
     SELECT s.id, s.receipt_no, s.branch_id, b.name AS branch_name,
            TO_CHAR(s.sold_on,'YYYY-MM-DD') AS sold_on, s.sold_at,
-           s.customer_name, s.payment_method, s.price_tier,
+           s.customer_name, s.debtor_id, d.name AS debtor_name,
+           s.payment_method, s.price_tier,
            s.subtotal, s.discount, s.total,
            s.status, s.void_reason, s.voided_at, s.notes,
            c.username AS cashier, v.username AS voided_by
     FROM pos_sales s
     JOIN branches b ON b.id = s.branch_id
+    LEFT JOIN debtors d ON d.id = s.debtor_id
     LEFT JOIN users c ON c.id = s.cashier_id
     LEFT JOIN users v ON v.id = s.voided_by
     WHERE s.id = $1
@@ -126,8 +129,8 @@ async function loadSale(client, id) {
    really does hold more than the system thinks, the fix is a manager's
    stock adjustment, which leaves a note saying so. */
 router.post('/sales', async (req, res) => {
-  const { branch_id, sold_on, items, customer_name, payment_method = 'cash',
-          price_tier = 'retail', discount, notes } = req.body;
+  const { branch_id, sold_on, items, customer_name, debtor_id,
+          payment_method = 'cash', price_tier = 'retail', discount, notes } = req.body;
 
   const scope = resolveBranch(req, branch_id);
   if (scope.error) return res.status(400).json({ error: scope.error });
@@ -152,6 +155,11 @@ router.post('/sales', async (req, res) => {
   }
   if (!TIERS.includes(price_tier)) {
     return res.status(400).json({ error: 'Price tier must be retail or wholesale' });
+  }
+  /* Credit is a debt, and a debt with nobody attached to it is how a book
+     ends up with a receipts column nobody can reconcile. */
+  if (payment_method === 'credit' && !debtor_id && !String(customer_name || '').trim()) {
+    return res.status(400).json({ error: 'A credit sale needs the customer it is owed by' });
   }
 
   const day = sold_on || new Date().toISOString().slice(0, 10);
@@ -226,16 +234,33 @@ router.post('/sales', async (req, res) => {
     const disc = Math.min(Math.max(money(discount), 0), subtotal);
     const total = money(subtotal - disc);
 
+    /* The account is resolved before the receipt is written so the whole
+       thing — sale, lines, movements and the debt — lands together or not
+       at all. A charge without its receipt is a balance nobody can explain. */
+    let debtor = null;
+    if (payment_method === 'credit') {
+      debtor = debtor_id
+        ? (await client.query('SELECT id, name FROM debtors WHERE id=$1', [debtor_id])).rows[0]
+        : await findOrCreateDebtor(client, customer_name, {
+            branchId: scope.branchId, userId: req.user.id,
+          });
+      if (!debtor) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'That customer account was not found' });
+      }
+    }
+
     const { rows: created } = await client.query(`
       INSERT INTO pos_sales
-        (receipt_no, branch_id, sold_on, cashier_id, customer_name,
+        (receipt_no, branch_id, sold_on, cashier_id, customer_name, debtor_id,
          payment_method, price_tier, subtotal, discount, total, notes)
       VALUES (
         'RC-' || TO_CHAR($2::date, 'YYYY') || '-' ||
           LPAD(NEXTVAL('pos_receipt_no_seq')::text, 5, '0'),
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
       ) RETURNING id
-    `, [scope.branchId, day, req.user.id, customer_name?.trim() || null,
+    `, [scope.branchId, day, req.user.id,
+        debtor?.name || customer_name?.trim() || null, debtor?.id || null,
         payment_method, price_tier, subtotal, disc, total, notes?.trim() || null]);
     const saleId = created[0].id;
 
@@ -257,6 +282,14 @@ router.post('/sales', async (req, res) => {
       refKind: 'pos_sale', refId: saleId,
       createdBy: req.user.id,
     })));
+
+    if (debtor && total > 0) {
+      await client.query(`
+        INSERT INTO debtor_entries
+          (debtor_id, entry_date, kind, amount, branch_id, ref_kind, ref_id, description, created_by)
+        VALUES ($1,$2,'charge',$3,$4,'pos_sale',$5,$6,$7)
+      `, [debtor.id, day, total, scope.branchId, saleId, 'Sold on credit', req.user.id]);
+    }
 
     const sale = await loadSale(client, saleId);
     await client.query('COMMIT');
@@ -346,7 +379,8 @@ router.post('/sales/:id/void', async (req, res) => {
     await client.query('BEGIN');
 
     const { rows: locked } = await client.query(`
-      SELECT id, branch_id, status, TO_CHAR(sold_on,'YYYY-MM-DD') AS sold_on,
+      SELECT id, branch_id, status, debtor_id, total, receipt_no,
+             TO_CHAR(sold_on,'YYYY-MM-DD') AS sold_on,
              sold_on = CURRENT_DATE AS is_today
       FROM pos_sales WHERE id = $1 FOR UPDATE
     `, [req.params.id]);
@@ -386,6 +420,19 @@ router.post('/sales/:id/void', async (req, res) => {
       createdBy: req.user.id,
     })));
 
+    /* A voided credit sale is a debt that never was. The charge is
+       reversed rather than deleted: a statement the customer has already
+       seen must not silently become a different one, so both the charge
+       and its cancellation stay on the account. */
+    if (sale.debtor_id && num(sale.total) > 0) {
+      await client.query(`
+        INSERT INTO debtor_entries
+          (debtor_id, entry_date, kind, amount, branch_id, ref_kind, ref_id, description, created_by)
+        VALUES ($1,$2,'adjustment',$3,$4,'pos_sale',$5,$6,$7)
+      `, [sale.debtor_id, sale.sold_on, -num(sale.total), sale.branch_id, sale.id,
+          `Receipt ${sale.receipt_no} voided — ${reason}`, req.user.id]);
+    }
+
     await client.query(`
       UPDATE pos_sales SET status='voided', voided_by=$1, voided_at=NOW(), void_reason=$2
       WHERE id=$3
@@ -403,12 +450,16 @@ router.post('/sales/:id/void', async (req, res) => {
 /* ══════════════════════════════════════════════════════════════
    CASH-UP
 
-   The attendant's end of the day. Everything the receipts already know is
-   read back rather than typed: sales, what was taken in cash, on mobile,
-   on card, and what went out on credit. What a person has to supply is
-   only what no receipt records — money collected against an old debt,
-   money taken in advance, cash paid out of the drawer, and what was
-   actually counted at closing.
+   The attendant's end of the day. Everything already recorded elsewhere
+   is read back rather than typed: sales, cash, mobile, card and credit
+   from the receipts, and money collected against old debts from the
+   debtors' ledger. The farm's paper book totals its debtor receipts
+   column into the cash summary by hand; here the same figure is only ever
+   held in one place, so the two cannot disagree.
+
+   What a person still supplies is what nothing else records — cash paid
+   out of the drawer, money taken in advance from someone with no account,
+   and what was actually counted at closing.
 
      expected = cash sales + debtor receipts + prepaids - expenses
      variance = counted - expected
@@ -416,6 +467,24 @@ router.post('/sales/:id/void', async (req, res) => {
    Credit sales never enter it: no money changed hands. Mobile and card
    are shown but not expected in the drawer, because they are not in it.
 ══════════════════════════════════════════════════════════════ */
+
+/**
+ * Money collected against old debts at this branch on this day.
+ *
+ * Read from the debtors' ledger rather than entered, so a payment taken
+ * at the counter reaches the day's cash without being keyed twice. A
+ * payment recorded without a branch — a manager settling an account from
+ * the office — belongs to no till and is deliberately not counted here;
+ * it still shows on the customer's statement and in the reports.
+ */
+async function dayDebtorReceipts(client, branchId, day) {
+  const { rows } = await client.query(`
+    SELECT ROUND(COALESCE(SUM(-amount), 0)::numeric, 2) AS received
+    FROM debtor_entries
+    WHERE kind = 'payment' AND branch_id = $1 AND entry_date = $2
+  `, [branchId, day]);
+  return num(rows[0].received);
+}
 
 /** The day's takings, split the way a cash-up needs them. */
 async function daySales(client, branchId, day) {
@@ -472,8 +541,9 @@ async function loadCashUp(client, branchId, day) {
   }
 
   const expenseTotal = expenses.reduce((a, x) => a + x.amount, 0);
+  const debtorReceipts = await dayDebtorReceipts(client, branchId, day);
+
   const entered = {
-    debtor_receipts: num(record?.debtor_receipts),
     prepaids:        num(record?.prepaids),
     counted_cash:    num(record?.counted_cash),
     mobile_counted:  num(record?.mobile_counted),
@@ -482,7 +552,7 @@ async function loadCashUp(client, branchId, day) {
   };
 
   const expected = money(
-    takings.cash_sales + entered.debtor_receipts + entered.prepaids - expenseTotal
+    takings.cash_sales + debtorReceipts + entered.prepaids - expenseTotal
   );
 
   return {
@@ -498,10 +568,24 @@ async function loadCashUp(client, branchId, day) {
     takings,
     expenses,
     expense_total: money(expenseTotal),
+    debtor_receipts: debtorReceipts,
+    debtor_payments: await dayDebtorPayments(client, branchId, day),
     ...entered,
     expected_cash: expected,
     variance: money(entered.counted_cash - expected),
   };
+}
+
+/* The payments behind the total, so the attendant can check the figure
+   against the money in front of them rather than taking it on trust. */
+async function dayDebtorPayments(client, branchId, day) {
+  const { rows } = await client.query(`
+    SELECT e.id, d.id AS debtor_id, d.name, -e.amount AS amount, e.description
+    FROM debtor_entries e JOIN debtors d ON d.id = e.debtor_id
+    WHERE e.kind = 'payment' AND e.branch_id = $1 AND e.entry_date = $2
+    ORDER BY e.id
+  `, [branchId, day]);
+  return rows.map(r => ({ ...r, amount: num(r.amount) }));
 }
 
 /* GET the cash-up for a day — defaults to today at the caller's branch. */
@@ -556,9 +640,12 @@ router.post('/cash-up', async (req, res) => {
       });
     }
 
+    /* debtor_receipts is deliberately absent: it comes from the debtors'
+       ledger. Accepting it here would let the day's cash disagree with the
+       statements the customers are holding. */
     const fields = [
       scope.branchId, day,
-      money(req.body.debtor_receipts), money(req.body.prepaids),
+      money(req.body.prepaids),
       money(req.body.counted_cash), money(req.body.mobile_counted),
       money(req.body.bank_deposit), money(req.body.float_retained),
       req.body.notes?.trim() || null,
@@ -567,11 +654,10 @@ router.post('/cash-up', async (req, res) => {
 
     const { rows: saved } = await client.query(`
       INSERT INTO pos_cash_ups
-        (branch_id, business_day, debtor_receipts, prepaids, counted_cash,
+        (branch_id, business_day, prepaids, counted_cash,
          mobile_counted, bank_deposit, float_retained, notes, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       ON CONFLICT (branch_id, business_day) DO UPDATE SET
-        debtor_receipts = EXCLUDED.debtor_receipts,
         prepaids        = EXCLUDED.prepaids,
         counted_cash    = EXCLUDED.counted_cash,
         mobile_counted  = EXCLUDED.mobile_counted,
