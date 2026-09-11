@@ -138,7 +138,7 @@ router.get('/cash-book', async (req, res) => {
         SELECT DISTINCT business_day FROM pos_cash_ups
           WHERE business_day BETWEEN $1 AND $2 ${branchFilter}
         UNION
-        SELECT DISTINCT entry_date FROM debtor_entries
+        SELECT DISTINCT entry_date FROM customer_entries
           WHERE kind = 'payment' AND entry_date BETWEEN $1 AND $2 ${branchFilter}
       ),
       takings AS (
@@ -176,7 +176,7 @@ router.get('/cash-book', async (req, res) => {
          already means the number of sales rung up that day. */
       collected AS (
         SELECT entry_date AS day, SUM(-amount) AS debtor_receipts
-        FROM debtor_entries
+        FROM customer_entries
         WHERE kind = 'payment' AND entry_date BETWEEN $1 AND $2 ${branchFilter}
         GROUP BY entry_date
       )
@@ -323,8 +323,8 @@ router.get('/debtors', async (req, res) => {
                MAX(e.entry_date) FILTER (WHERE e.kind = 'charge')  AS last_charge,
                COALESCE(SUM(e.amount)  FILTER (WHERE e.kind = 'charge'  AND e.entry_date <= $1), 0) AS charged,
                COALESCE(SUM(-e.amount) FILTER (WHERE e.kind = 'payment' AND e.entry_date <= $1), 0) AS paid
-        FROM debtors d
-        LEFT JOIN debtor_entries e ON e.debtor_id = d.id
+        FROM customers d
+        LEFT JOIN customer_entries e ON e.customer_id = d.id
         GROUP BY d.id
       )
       SELECT l.*, b.name AS branch_name,
