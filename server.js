@@ -15,6 +15,7 @@ const { initNewTables, initHealthRecordsTables } = require('./lib/initTables');
 const { initStockTables } = require('./lib/initStock');
 const { initPosTables }   = require('./lib/initPos');
 const { initCustomerTables } = require('./lib/initCustomers');
+const { initExpenseTables }  = require('./lib/initExpenses');
 
 /* Route modules — one file per resource, each a plain express.Router().
    Role gates are applied once, here, at the mount point (see the "ROLE
@@ -40,6 +41,7 @@ const stockRoutes       = require('./routes/stock');
 const issuesRoutes      = require('./routes/issues');
 const posRoutes         = require('./routes/pos');
 const reportsRoutes     = require('./routes/reports');
+const expensesRoutes    = require('./routes/expenses');
 const { router: customersRoutes } = require('./routes/customers');
 
 const app = express();
@@ -61,7 +63,7 @@ app.use(express.json());
 
 /* Start the schema work now, so a warm process has it done already. */
 const initAllTables = () => Promise.all([
-  initAiTables(), initNewTables(), initHealthRecordsTables(),
+  initAiTables(), initNewTables(), initHealthRecordsTables(), initExpenseTables(),
   /* POS tables reference branches and products, so the stock schema has to
      be in place before they are created. */
   /* Each step depends on the tables the one before it creates: POS
@@ -139,6 +141,11 @@ app.use('/api/pos',      verifyToken, requireBranchAccess, posRoutes);
    the counter, so the book is theirs to read and add to; writing off a
    balance is gated inside the router. */
 app.use('/api/customers', verifyToken, requireBranchAccess, customersRoutes);
+
+/* What the farm spends. Management's book, read by the same two roles as
+   the sales reports: an attendant runs one counter and has no business in
+   the household's line or the payroll. */
+app.use('/api/expenses', verifyToken, requireProduction, expensesRoutes);
 
 /* Reports span every branch and are management's view of the business, so
    they stay in manager territory rather than following the branch gate

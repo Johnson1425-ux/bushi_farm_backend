@@ -1015,23 +1015,95 @@ async function alertSignals() {
   };
 }
 
+/* ── what it cost ──────────────────────────────────────────
+   The other half of a period. Revenue without the spending beside it
+   reads as a good month whatever was paid out to produce it, and the
+   farm's own book has always kept the two apart — one workbook for the
+   milk, another for the money going out.
+
+   Categories are the farm's own lines, so "Home affairs" really is the
+   household and is not farm cost; the note says so rather than leaving
+   the model to net it off against milk revenue on its own. */
+
+async function expensesContext({ from, to, prevFrom, prevTo }) {
+  const totalSql = `
+    SELECT COUNT(*)::int                              AS entries,
+           ROUND(COALESCE(SUM(amount), 0)::numeric, 2) AS total
+    FROM expenses WHERE entry_date BETWEEN $1 AND $2
+  `;
+
+  const [totals, prev, byCategory, biggest, monthly] = await Promise.all([
+    pool.query(totalSql, [from, to]),
+    pool.query(totalSql, [prevFrom, prevTo]),
+    pool.query(`
+      SELECT c.name AS category,
+             ROUND(COALESCE(SUM(e.amount), 0)::numeric, 2) AS total,
+             COUNT(e.id)::int                              AS entries,
+             ROUND(COALESCE((
+               SELECT SUM(p.amount) FROM expenses p
+               WHERE p.category_id = c.id AND p.entry_date BETWEEN $3 AND $4
+             ), 0)::numeric, 2)                            AS previous_period
+      FROM expense_categories c
+      JOIN expenses e ON e.category_id = c.id AND e.entry_date BETWEEN $1 AND $2
+      GROUP BY c.id, c.name ORDER BY total DESC
+    `, [from, to, prevFrom, prevTo]),
+    /* The handful of lines that moved the total. A month of fuel at
+       40,000 a time is not what makes one month differ from the last —
+       the lorry repair and the tractor build are. */
+    pool.query(`
+      SELECT TO_CHAR(e.entry_date,'YYYY-MM-DD') AS date, c.name AS category,
+             e.details, ROUND(e.amount::numeric, 2) AS amount
+      FROM expenses e JOIN expense_categories c ON c.id = e.category_id
+      WHERE e.entry_date BETWEEN $1 AND $2
+      ORDER BY e.amount DESC LIMIT 12
+    `, [from, to]),
+    /* A year of month totals, so a trend can be read without a second
+       call. Cheap: one row per month. */
+    pool.query(`
+      SELECT TO_CHAR(DATE_TRUNC('month', entry_date), 'YYYY-MM') AS month,
+             ROUND(SUM(amount)::numeric, 2) AS total
+      FROM expenses
+      WHERE entry_date >= (DATE_TRUNC('month', $1::date) - INTERVAL '11 months')
+        AND entry_date <= $1
+      GROUP BY 1 ORDER BY 1
+    `, [to]),
+  ]);
+
+  return {
+    note: 'What the farm paid out, from the monthly expenses book. Every figure is the sum '
+        + 'of the lines beneath it. "Home affairs" is the household rather than farm cost, '
+        + 'and "BMH" is the milk-buying and shop side, so neither belongs in a cost-per-litre '
+        + 'for the herd. A month with nothing against it usually means its workbook has not '
+        + 'been uploaded yet, not that nothing was spent.',
+    totals: { entries: totals.rows[0].entries, total: num(totals.rows[0].total) },
+    previous_period: { entries: prev.rows[0].entries, total: num(prev.rows[0].total) },
+    by_category: byCategory.rows.map(r => ({
+      category: r.category, total: num(r.total), entries: r.entries,
+      previous_period: num(r.previous_period),
+    })),
+    largest_lines: biggest.rows.map(r => ({ ...r, amount: num(r.amount) })),
+    monthly_trend: monthly.rows.map(r => ({ month: r.month, total: num(r.total) })),
+  };
+}
+
 /* ── the whole farm, for a period ────────────────────────── */
 
 async function farmSnapshot({ from, to } = {}) {
   const period = resolvePeriod(from, to);
 
-  const [production, health, pregnancies, sales, debtors, inventory, processing] =
+  const [production, health, pregnancies, sales, debtors, expenses, inventory, processing] =
     await Promise.all([
       productionContext(period),
       healthContext(period),
       pregnancyContext(period),
       salesContext(period),
       customersContext(period),
+      expensesContext(period),
       inventoryContext(period),
       processingContext(),
     ]);
 
-  return { period, production, health, pregnancies, sales, debtors, inventory, processing };
+  return { period, production, health, pregnancies, sales, debtors, expenses, inventory, processing };
 }
 
 module.exports = {
@@ -1043,6 +1115,7 @@ module.exports = {
   pregnancyContext,
   salesContext,
   customersContext,
+  expensesContext,
   inventoryContext,
   processingContext,
   processingMonth,
