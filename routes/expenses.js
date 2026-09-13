@@ -76,6 +76,68 @@ router.get('/categories', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+/* ── one category, month by month ────────────────────────────
+   What a heading has cost over a year, and the lines that make each
+   month up. This is the question a category is clicked for: not what
+   the farm spent on feed in September, which the month view already
+   says, but whether feed has been climbing since June — and which
+   purchases did it.
+
+   Every month of the year comes back whether anything was spent in it
+   or not, because a gap in a category is a reading in itself. */
+router.get('/categories/:id', async (req, res) => {
+  const year = parseInt(req.query.year, 10) || new Date().getUTCFullYear();
+  try {
+    const { rows: cat } = await pool.query(
+      'SELECT id, name, sort_order, active, notes FROM expense_categories WHERE id=$1',
+      [req.params.id]
+    );
+    if (!cat.length) return res.status(404).json({ error: 'That category no longer exists' });
+
+    const [entries, byYear] = await Promise.all([
+      pool.query(`${SELECT_ENTRY}
+         WHERE e.category_id = $1 AND EXTRACT(YEAR FROM e.entry_date) = $2
+         ORDER BY e.entry_date DESC, e.id DESC`, [req.params.id, year]),
+      pool.query(`
+        SELECT EXTRACT(YEAR FROM entry_date)::int AS year,
+               COALESCE(SUM(amount), 0) AS total,
+               COUNT(*)::int            AS entry_count
+        FROM expenses WHERE category_id = $1
+        GROUP BY year ORDER BY year DESC
+      `, [req.params.id]),
+    ]);
+
+    const rows = entries.rows.map(shape);
+
+    const months = Array.from({ length: 12 }, (_, i) => ({
+      month: i + 1, total: 0, entry_count: 0, entries: [],
+    }));
+    for (const e of rows) {
+      const m = months[Number(e.entry_date.slice(5, 7)) - 1];
+      m.entries.push(e);
+      m.entry_count++;
+      m.total = money(m.total + e.amount);
+    }
+
+    const spent = months.filter(m => m.entry_count);
+    const total = money(spent.reduce((a, m) => a + m.total, 0));
+
+    res.json({
+      category: cat[0],
+      year,
+      months,
+      total,
+      entry_count: rows.length,
+      /* The average is over the months something was actually spent in.
+         Dividing by twelve in September would make every line look half
+         what it is. */
+      monthly_average: spent.length ? money(total / spent.length) : 0,
+      busiest_month: spent.length ? spent.reduce((a, m) => (m.total > a.total ? m : a)).month : null,
+      years: byYear.rows.map(r => ({ year: r.year, total: num(r.total), entry_count: r.entry_count })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.post('/categories', async (req, res) => {
   const name = String(req.body.name || '').trim();
   if (!name) return res.status(400).json({ error: 'A category needs a name' });
@@ -117,6 +179,30 @@ router.patch('/categories/:id', async (req, res) => {
     if (err.code === '23505') return res.status(409).json({ error: 'That category already exists' });
     res.status(500).json({ error: err.message });
   }
+});
+
+/* A heading opened by mistake can go, as long as nothing was ever filed
+   under it. Once it has entries it stays: they are the record, and a
+   heading they can no longer name would leave money with nowhere to sit.
+   Closing it is the answer then — the summary drops it and the history
+   keeps it. */
+router.delete('/categories/:id', async (req, res) => {
+  try {
+    const { rows: used } = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM expenses WHERE category_id=$1', [req.params.id]
+    );
+    if (used[0].n > 0) {
+      return res.status(409).json({
+        error: `${used[0].n} line(s) are filed under this category, so it cannot be deleted. `
+             + 'Close it instead — it comes off the forms and its history stays.',
+      });
+    }
+    const { rows } = await pool.query(
+      'DELETE FROM expense_categories WHERE id=$1 RETURNING name', [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'That category no longer exists' });
+    res.json({ ok: true, name: rows[0].name });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 /* ══════════════════════════════════
