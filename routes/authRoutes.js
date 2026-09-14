@@ -8,41 +8,54 @@ const {
 const {
   issueRefreshToken, rotateRefreshToken,
   revokeRefreshToken, revokeAllForUser, listSessions,
+  REFRESH_DAYS,
 } = require('../lib/refreshTokens');
+const {
+  setRefreshCookie, clearRefreshCookie, readRefreshCookie,
+} = require('../lib/sessionCookie');
+const { rejectForeignOrigin } = require('../lib/origins');
 
 const router = express.Router();
 
 /* ══════════════════════════════════
    SIGNING IN
 
-   A sign-in produces two things:
+   A sign-in produces two things, which leave by different doors:
 
-     token        — a JWT good for ACCESS_TTL_SECONDS (15 minutes), sent on
-                    every request and verified with nothing but the key.
-     refreshToken — an opaque secret good for a month, sent only to
-                    /auth/refresh, revocable, and rotated every time it is
-                    used.
+     the access token   — a JWT good for ACCESS_TTL_SECONDS (15 minutes),
+                          returned in the response body, sent on every
+                          request, verified with nothing but the key.
+     the refresh token  — an opaque secret good for a month, set as an
+                          httpOnly cookie and never put in a body,
+                          revocable, and rotated every time it is used.
 
-   Before this split there was one seven-day JWT and no way to end a
-   session: signing out only forgot the token, it did not stop it working.
+   Before this split there was one seven-day JWT in localStorage and no
+   way to end a session: signing out only forgot the token, it did not
+   stop it working, and any injected script could read it and keep it.
 
-   `token` keeps its name in the response so a client that has not been
-   updated yet still finds what it expects — it simply expires sooner than
-   it used to, and a client that ignores refreshToken will ask its user to
-   sign in again after fifteen minutes rather than breaking.
+   The refresh token now never passes through JavaScript at all. What an
+   injected script can still reach is the access token, for the fifteen
+   minutes it lasts — bad, but survivable, and it ends on its own.
 ══════════════════════════════════ */
 
-/** What the client is given after a successful sign-in or refresh. */
-async function sessionPayload(user, refresh) {
-  return {
+/**
+ * Hand the client its session: the cookie on the response, the access
+ * token in the body.
+ */
+async function sendSession(res, user, refresh) {
+  setRefreshCookie(res, refresh.token, REFRESH_DAYS);
+  res.json({
     token: signAccessToken(user, { sid: refresh.familyId }),
-    refreshToken: refresh.token,
     expiresIn: ACCESS_TTL_SECONDS,
     user: await withBranchName(user),
-  };
+  });
 }
 
-router.post('/login', loginRateLimit, async (req, res) => {
+/* Guarded like the other two: a sign-in now sets a cookie, and a hostile
+   page that could trigger one would be setting *its* session in the
+   user's browser, leaving them typing the day's takings into an account
+   that is not theirs. */
+router.post('/login', rejectForeignOrigin, loginRateLimit, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   try {
@@ -64,7 +77,7 @@ router.post('/login', loginRateLimit, async (req, res) => {
       id: user.id, username: user.username,
       role: user.role, branch_id: user.branch_id ?? null,
     };
-    res.json(await sessionPayload(claims, await issueRefreshToken(user.id, { req })));
+    await sendSession(res, claims, await issueRefreshToken(user.id, { req }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -73,25 +86,31 @@ router.post('/login', loginRateLimit, async (req, res) => {
 /* ══════════════════════════════════
    REFRESH
 
-   Public: the refresh token is the credential, and the expired access
-   token it replaces cannot be required here — needing a live access token
-   to get a live access token would defeat the whole arrangement.
+   No access token required: the cookie is the credential, and needing a
+   live access token to obtain a live access token would defeat the whole
+   arrangement. rejectForeignOrigin is what stands in its place, because a
+   cookie is sent by the browser whether or not the page meant it.
 
    The user row is re-read inside rotateRefreshToken(), so the new access
    token reflects the account as it stands now. A deleted account has no
    row to join against and cannot refresh at all.
 ══════════════════════════════════ */
-router.post('/refresh', async (req, res) => {
-  const presented = req.body?.refreshToken;
+router.post('/refresh', rejectForeignOrigin, async (req, res) => {
+  /* The cookie first. `refreshToken` in the body is accepted only to
+     carry over a session from the release that kept the token in
+     localStorage: the client sends what it had once, gets a cookie back,
+     and forgets it. Nothing hands out a token in a body any more. */
+  const presented = readRefreshCookie(req) || req.body?.refreshToken;
   try {
     const result = await rotateRefreshToken(presented, { req });
     if (result.error) {
-      /* 401 with a code the client can act on: it clears the stored
-         session and sends the user to sign in, rather than retrying a
-         token that will never work again. */
+      /* Take the cookie with it. A rejected token is never going to work
+         again, and leaving it in the browser means every later refresh
+         presents the same dead credential. */
+      clearRefreshCookie(res);
       return res.status(401).json({ error: result.error, code: 'refresh_rejected' });
     }
-    res.json(await sessionPayload(result.user, result));
+    await sendSession(res, result.user, result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -100,10 +119,13 @@ router.post('/refresh', async (req, res) => {
 /* Signing out now actually ends the session rather than only forgetting
    it. No access token is required — a client whose access token has
    already expired still has to be able to sign out — and an unknown token
-   is a silent no-op, so this cannot be used to probe which tokens exist. */
-router.post('/logout', async (req, res) => {
+   is a silent no-op, so this cannot be used to probe which tokens exist.
+   The cookie is cleared either way, so the browser is left signed out
+   even if there was nothing on the server to revoke. */
+router.post('/logout', rejectForeignOrigin, async (req, res) => {
   try {
-    await revokeRefreshToken(req.body?.refreshToken);
+    await revokeRefreshToken(readRefreshCookie(req) || req.body?.refreshToken);
+    clearRefreshCookie(res);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -125,6 +147,7 @@ router.get('/sessions', verifyToken, async (req, res) => {
 router.post('/logout-all', verifyToken, async (req, res) => {
   try {
     const ended = await revokeAllForUser(req.user.id);
+    clearRefreshCookie(res);
     res.json({ ok: true, sessions_ended: ended });
   } catch (err) {
     res.status(500).json({ error: err.message });
