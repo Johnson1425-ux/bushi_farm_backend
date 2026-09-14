@@ -62,6 +62,42 @@ async function initDB() {
       );
       CREATE INDEX IF NOT EXISTS idx_inv_logs_item ON inventory_logs(item_id);
       CREATE INDEX IF NOT EXISTS idx_inv_logs_date ON inventory_logs(date);
+
+      /* A stock take: the shelf counted against the book.
+
+         Kept as a document rather than as a handful of loose corrections,
+         because a variance only means anything next to the count that
+         produced it. A count is typed up as a draft, and posting it writes
+         one 'adjust' movement per line that disagrees — so every correction
+         to the book is traceable to the day somebody stood in the store and
+         counted. */
+      CREATE TABLE IF NOT EXISTS inventory_counts (
+        id         SERIAL PRIMARY KEY,
+        ref        TEXT NOT NULL UNIQUE,
+        count_date DATE NOT NULL,
+        status     TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','posted','cancelled')),
+        notes      TEXT,
+        counted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        posted_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        posted_at  TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_inv_counts_date ON inventory_counts(count_date);
+
+      /* book_qty is filled in at posting, never before: it is what the
+         ledger said at the moment the correction was made, and re-deriving
+         it later from a ledger the count itself has since changed would
+         give a different — and wrong — answer every time it is read. */
+      CREATE TABLE IF NOT EXISTS inventory_count_lines (
+        id          SERIAL PRIMARY KEY,
+        count_id    INTEGER NOT NULL REFERENCES inventory_counts(id) ON DELETE CASCADE,
+        item_id     INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+        counted_qty NUMERIC NOT NULL DEFAULT 0,
+        book_qty    NUMERIC,
+        notes       TEXT,
+        UNIQUE (count_id, item_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_inv_count_lines_count ON inventory_count_lines(count_id);
       
       CREATE TABLE IF NOT EXISTS sales (
         id              SERIAL PRIMARY KEY,
@@ -230,6 +266,93 @@ async function initDB() {
           CHECK (status IN ('active', 'dead', 'sold', 'culled'));
 
         CREATE INDEX IF NOT EXISTS idx_cows_status ON cows(status);
+      `],
+
+      /* Inventory: an item the store can actually run.
+
+         The original two columns — name and unit — could say what a thing
+         was called and nothing about how to keep it. No reorder level, so
+         the only warning anyone got was "out of stock", which arrives on
+         the morning packing has already stopped. No unit cost, so the
+         value sitting in the store was unknowable. No category, so the
+         packaging bottles were listed in amongst the spanners.
+
+         `status` retires an item without deleting it. Deleting cascades
+         through inventory_logs and takes every movement ever filed against
+         it with it, which silently rewrites last year's consumption for a
+         line the store merely stopped carrying. */
+      ['inventory_items columns', `
+        ALTER TABLE inventory_items
+          ADD COLUMN IF NOT EXISTS code          TEXT,
+          ADD COLUMN IF NOT EXISTS category      TEXT NOT NULL DEFAULT 'general',
+          ADD COLUMN IF NOT EXISTS reorder_level NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS reorder_qty   NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS unit_cost     NUMERIC NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS supplier      TEXT,
+          ADD COLUMN IF NOT EXISTS location      TEXT,
+          ADD COLUMN IF NOT EXISTS status        TEXT NOT NULL DEFAULT 'active',
+          ADD COLUMN IF NOT EXISTS archived_at   TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ DEFAULT NOW();
+
+        ALTER TABLE inventory_items DROP CONSTRAINT IF EXISTS inventory_items_status_check;
+        UPDATE inventory_items SET status = 'active'
+          WHERE status IS NULL OR status NOT IN ('active', 'archived');
+        ALTER TABLE inventory_items ADD CONSTRAINT inventory_items_status_check
+          CHECK (status IN ('active', 'archived'));
+
+        ALTER TABLE inventory_items DROP CONSTRAINT IF EXISTS inventory_items_category_check;
+        UPDATE inventory_items SET category = 'general'
+          WHERE category IS NULL OR category NOT IN
+            ('packaging','ingredient','chemical','spare','tool','ppe','general');
+        ALTER TABLE inventory_items ADD CONSTRAINT inventory_items_category_check
+          CHECK (category IN ('packaging','ingredient','chemical','spare','tool','ppe','general'));
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_inv_items_code
+          ON inventory_items(LOWER(code)) WHERE code IS NOT NULL AND code <> '';
+        CREATE INDEX IF NOT EXISTS idx_inv_items_status ON inventory_items(status);
+      `],
+
+      /* The balance is the ledger summed, and only the ledger.
+
+         `current_stock` was declared on day one, never written to, and left
+         at zero on every row — while /inventory/items quietly returned a
+         second column of the same name computed from the logs. Two answers
+         to one question, one of them always wrong, distinguishable only by
+         which query you happened to read. Dropping it leaves one. */
+      ['inventory_items drop cached balance', `
+        ALTER TABLE inventory_items DROP COLUMN IF EXISTS current_stock;
+      `],
+
+      /* A movement that says what actually happened.
+
+         'damage' and 'return' are the two the store was missing. Breakages
+         used to be filed as 'out' — so bottles smashed in the packing hall
+         and bottles that left holding yoghurt were the same row, and the
+         damage rate, which is the number that tells you a crate is being
+         stacked wrong, could not be recovered from the records at all.
+         'adjust' carries a signed quantity because a stock count corrects
+         in both directions; it is the one type allowed to be negative.
+
+         created_by answers "who took the bottles", which the old logs had
+         no column for. */
+      ['inventory_logs columns', `
+        ALTER TABLE inventory_logs
+          ADD COLUMN IF NOT EXISTS unit_cost  NUMERIC,
+          ADD COLUMN IF NOT EXISTS reference  TEXT,
+          ADD COLUMN IF NOT EXISTS party      TEXT,
+          ADD COLUMN IF NOT EXISTS created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          ADD COLUMN IF NOT EXISTS count_id   INTEGER REFERENCES inventory_counts(id) ON DELETE SET NULL;
+
+        ALTER TABLE inventory_logs DROP CONSTRAINT IF EXISTS inventory_logs_type_check;
+        ALTER TABLE inventory_logs ADD CONSTRAINT inventory_logs_type_check
+          CHECK (type IN ('in','out','damage','return','adjust'));
+
+        ALTER TABLE inventory_logs DROP CONSTRAINT IF EXISTS inventory_logs_quantity_check;
+        ALTER TABLE inventory_logs ADD CONSTRAINT inventory_logs_quantity_check
+          CHECK (quantity <> 0 AND (quantity > 0 OR type = 'adjust'));
+
+        CREATE INDEX IF NOT EXISTS idx_inv_logs_type  ON inventory_logs(type);
+        CREATE INDEX IF NOT EXISTS idx_inv_logs_count ON inventory_logs(count_id);
       `],
 
       /* One upload per month, enforced rather than assumed: the upload route
