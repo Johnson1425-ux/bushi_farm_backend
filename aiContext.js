@@ -12,6 +12,7 @@
      • Never return raw rows for an unbounded table.
 ══════════════════════════════════════════════════════════════ */
 const { pool } = require('./db');
+const { balance } = require('./lib/inventoryLedger');
 const { applyIssued, ledgerIssuedDaily } = require('./lib/processingReconcile');
 const { litresFor } = require('./processingCatalog');
 const { COLUMNS: HEALTH_RECORD_COLUMNS } = require('./lib/healthRecordForm');
@@ -449,20 +450,27 @@ async function customersContext({ from, to }) {
 async function inventoryContext({ from, to }) {
   const [stock, movements] = await Promise.all([
     pool.query(`
-      SELECT i.name, i.unit, i.notes,
-             ROUND(COALESCE(SUM(
-               CASE WHEN l.type = 'in' THEN l.quantity ELSE -l.quantity END
-             ), 0)::numeric, 2) AS current_stock
+      SELECT i.name, i.unit, i.category, i.notes, i.supplier,
+             i.reorder_level, i.unit_cost,
+             ROUND(${balance('l')}::numeric, 2) AS current_stock
       FROM inventory_items i
       LEFT JOIN inventory_logs l ON l.item_id = i.id
-      GROUP BY i.id, i.name, i.unit, i.notes
+      WHERE i.status = 'active'
+      GROUP BY i.id
       ORDER BY current_stock ASC
     `),
 
+    /* Damage is its own column, not folded into "used".
+       "We got through 4,000 bottles" and "we got through 3,600 and broke
+       400" are different facts about the same month, and the second is the
+       one worth asking a question about. */
     pool.query(`
       SELECT i.name, i.unit,
-             ROUND(SUM(CASE WHEN l.type = 'in'  THEN l.quantity ELSE 0 END)::numeric, 2) AS received,
-             ROUND(SUM(CASE WHEN l.type = 'out' THEN l.quantity ELSE 0 END)::numeric, 2) AS used
+             ROUND(SUM(CASE WHEN l.type = 'in'     THEN l.quantity ELSE 0 END)::numeric, 2) AS received,
+             ROUND(SUM(CASE WHEN l.type = 'out'    THEN l.quantity ELSE 0 END)::numeric, 2) AS used,
+             ROUND(SUM(CASE WHEN l.type = 'damage' THEN l.quantity ELSE 0 END)::numeric, 2) AS damaged,
+             ROUND(SUM(CASE WHEN l.type = 'return' THEN l.quantity ELSE 0 END)::numeric, 2) AS returned,
+             ROUND(SUM(CASE WHEN l.type = 'adjust' THEN l.quantity ELSE 0 END)::numeric, 2) AS count_adjustments
       FROM inventory_logs l
       JOIN inventory_items i ON i.id = l.item_id
       WHERE l.date BETWEEN $1 AND $2
@@ -474,16 +482,42 @@ async function inventoryContext({ from, to }) {
   const items = stock.rows.map(r => ({
     name: r.name,
     unit: r.unit,
+    category: r.category,
     current_stock: num(r.current_stock),
+    reorder_level: num(r.reorder_level),
+    stock_value: Math.round(num(r.current_stock) * num(r.unit_cost) * 100) / 100,
+    supplier: r.supplier,
     notes: r.notes,
   }));
 
+  const periodRows = movements.rows.map(r => {
+    const used = num(r.used), damaged = num(r.damaged);
+    return {
+      name: r.name, unit: r.unit,
+      received: num(r.received), used, damaged,
+      returned: num(r.returned),
+      count_adjustments: num(r.count_adjustments),
+      damage_rate_pct: used + damaged > 0
+        ? Math.round((damaged / (used + damaged)) * 1000) / 10
+        : 0,
+    };
+  });
+
   return {
     items,
+    stock_value: Math.round(items.reduce((t, i) => t + i.stock_value, 0) * 100) / 100,
     out_of_stock: items.filter(i => i.current_stock <= 0).map(i => i.name),
-    movements_in_period: movements.rows.map(r => ({
-      name: r.name, unit: r.unit, received: num(r.received), used: num(r.used),
-    })),
+    /* Below the level the store itself set for reordering — the list
+       somebody has to act on, as opposed to the list of things that have
+       already run out and stopped the line. */
+    needs_ordering: items
+      .filter(i => i.current_stock > 0 && i.reorder_level > 0 && i.current_stock <= i.reorder_level)
+      .map(i => ({ name: i.name, on_hand: i.current_stock, reorder_level: i.reorder_level, unit: i.unit })),
+    movements_in_period: periodRows,
+    damaged_in_period: periodRows
+      .filter(r => r.damaged > 0)
+      .sort((a, b) => b.damaged - a.damaged)
+      .map(r => ({ name: r.name, unit: r.unit, damaged: r.damaged, damage_rate_pct: r.damage_rate_pct })),
   };
 }
 
@@ -902,17 +936,18 @@ async function alertSignals() {
       ORDER BY p.expected_due_date
     `),
 
+    /* Out, or down to the level the store reorders at — the second is the
+       one a briefing can still do something about. */
     pool.query(`
-      SELECT i.name, i.unit,
-             ROUND(COALESCE(SUM(
-               CASE WHEN l.type = 'in' THEN l.quantity ELSE -l.quantity END
-             ), 0)::numeric, 2) AS current_stock
+      SELECT i.name, i.unit, i.reorder_level,
+             ROUND(${balance('l')}::numeric, 2) AS current_stock
       FROM inventory_items i
       LEFT JOIN inventory_logs l ON l.item_id = i.id
-      GROUP BY i.id, i.name, i.unit
-      HAVING COALESCE(SUM(
-        CASE WHEN l.type = 'in' THEN l.quantity ELSE -l.quantity END
-      ), 0) <= 0
+      WHERE i.status = 'active'
+      GROUP BY i.id, i.name, i.unit, i.reorder_level
+      HAVING ${balance('l')} <= 0
+          OR (i.reorder_level > 0 AND ${balance('l')} <= i.reorder_level)
+      ORDER BY ${balance('l')} ASC
     `),
 
     // Cows with no milk record in the last 3 days despite having history —
@@ -1007,8 +1042,16 @@ async function alertSignals() {
       drop_pct: num(r.drop_pct),
     })),
     births_window: dueSoon.rows,
-    out_of_stock: lowStock.rows.map(r => ({
-      name: r.name, unit: r.unit, current_stock: num(r.current_stock),
+    /* Named for what it now holds. The query used to return only items
+       already at zero; it returns those at or below their reorder level
+       too, and calling that "out_of_stock" would have the briefing report
+       a store as empty when it is merely due an order. `state` says which
+       of the two each row is. */
+    stock_needing_attention: lowStock.rows.map(r => ({
+      name: r.name, unit: r.unit,
+      current_stock: num(r.current_stock),
+      reorder_level: num(r.reorder_level),
+      state: num(r.current_stock) <= 0 ? 'out of stock' : 'at or below reorder level',
     })),
     cows_missing_records: staleCows.rows,
     recent_diseases: recentDisease.rows,
