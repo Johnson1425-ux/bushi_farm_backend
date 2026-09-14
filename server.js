@@ -16,6 +16,8 @@ const { initStockTables } = require('./lib/initStock');
 const { initPosTables }   = require('./lib/initPos');
 const { initCustomerTables } = require('./lib/initCustomers');
 const { initExpenseTables }  = require('./lib/initExpenses');
+const { initRefreshTokenTables, purgeExpiredTokens } = require('./lib/refreshTokens');
+const { ALLOWED_ORIGINS } = require('./lib/origins');
 
 /* Route modules — one file per resource, each a plain express.Router().
    Role gates are applied once, here, at the mount point (see the "ROLE
@@ -49,11 +51,20 @@ const app = express();
 /* ── CORS ─────────────────────────────────────────────────
    One policy, applied to both real requests and preflights. A bare cors()
    call anywhere else would set Access-Control-Allow-Origin: * and silently
-   override the allowlist below, so there must not be one. */
+   override the allowlist below, so there must not be one.
+
+   `credentials` is what lets the refresh cookie travel at all, and it is
+   also why the allowlist can never become a wildcard: a browser refuses
+   to send credentials to an API that answers '*'.
+
+   X-Requested-With is on the list because the cookie-authenticated
+   endpoints require it (lib/origins.js). It is not a CORS-safelisted
+   header, so asking for it forces a preflight — which is precisely the
+   property being relied on there. */
 const corsOptions = {
-  origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://bushi-farm.vercel.app'],
+  origin: ALLOWED_ORIGINS,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true,
 };
 
@@ -64,6 +75,11 @@ app.use(express.json());
 /* Start the schema work now, so a warm process has it done already. */
 const initAllTables = () => Promise.all([
   initAiTables(), initNewTables(), initHealthRecordsTables(), initExpenseTables(),
+  /* Sessions live here. Spent and long-expired rows are swept on the way
+     in — there is no scheduler on a serverless host, and a cold start is
+     the one moment where a housekeeping query costs nothing anybody is
+     waiting on. A failure to sweep must not fail the boot. */
+  initRefreshTokenTables().then(() => purgeExpiredTokens().catch(() => {})),
   /* POS tables reference branches and products, so the stock schema has to
      be in place before they are created. */
   /* Each step depends on the tables the one before it creates: POS
