@@ -16,6 +16,7 @@ const { initStockTables } = require('./lib/initStock');
 const { initPosTables }   = require('./lib/initPos');
 const { initCustomerTables } = require('./lib/initCustomers');
 const { initExpenseTables }  = require('./lib/initExpenses');
+const { initRefreshTokenTables, purgeExpiredTokens } = require('./lib/refreshTokens');
 
 /* Route modules — one file per resource, each a plain express.Router().
    Role gates are applied once, here, at the mount point (see the "ROLE
@@ -64,6 +65,11 @@ app.use(express.json());
 /* Start the schema work now, so a warm process has it done already. */
 const initAllTables = () => Promise.all([
   initAiTables(), initNewTables(), initHealthRecordsTables(), initExpenseTables(),
+  /* Sessions live here. Spent and long-expired rows are swept on the way
+     in — there is no scheduler on a serverless host, and a cold start is
+     the one moment where a housekeeping query costs nothing anybody is
+     waiting on. A failure to sweep must not fail the boot. */
+  initRefreshTokenTables().then(() => purgeExpiredTokens().catch(() => {})),
   /* POS tables reference branches and products, so the stock schema has to
      be in place before they are created. */
   /* Each step depends on the tables the one before it creates: POS
