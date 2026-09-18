@@ -8,7 +8,6 @@ const {
 const {
   issueRefreshToken, rotateRefreshToken,
   revokeRefreshToken, revokeAllForUser, listSessions,
-  REFRESH_DAYS,
 } = require('../lib/refreshTokens');
 const {
   setRefreshCookie, clearRefreshCookie, readRefreshCookie,
@@ -43,7 +42,7 @@ const router = express.Router();
  * token in the body.
  */
 async function sendSession(res, user, refresh) {
-  setRefreshCookie(res, refresh.token, REFRESH_DAYS);
+  setRefreshCookie(res, refresh.token, refresh.expiresAt);
   res.json({
     token: signAccessToken(user, { sid: refresh.familyId }),
     expiresIn: ACCESS_TTL_SECONDS,
