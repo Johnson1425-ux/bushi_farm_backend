@@ -5,7 +5,9 @@ const { pool } = require('../db');
 const { parseDate } = require('../lib/parsers');
 const {
   TYPES, CARD_COLUMNS, balance, signedQty,
-  onHandFor, shortfallMessage, stockState, num,
+  onHandFor, shortfallMessage, stockState,
+  packSize, packCost, toPacks, toBase, lineCost, averageCost,
+  num, round,
 } = require('../lib/inventoryLedger');
 
 const router = express.Router();
@@ -40,13 +42,14 @@ const upload = multer({
    opposite movement that says why.
 ══════════════════════════════════════════════════════════════ */
 
-const CATEGORIES = ['packaging', 'ingredient', 'chemical', 'spare', 'tool', 'ppe', 'general'];
+const CATEGORIES = ['packaging', 'ingredient', 'medicine', 'chemical', 'spare', 'tool', 'ppe', 'general'];
 
 /* The columns an item row is made of, named once. Both spellings are
    generated from this list so a column added to one cannot go missing
    from the other. */
 const ITEM_COLUMNS = [
-  'id', 'name', 'code', 'category', 'unit', 'notes', 'supplier', 'location',
+  'id', 'name', 'code', 'category', 'unit', 'pack_unit', 'pack_size',
+  'notes', 'supplier', 'location',
   'reorder_level', 'reorder_qty', 'unit_cost', 'status',
   'created_at', 'updated_at', 'archived_at',
 ];
@@ -65,7 +68,10 @@ function shapeItem(r) {
     total_returned: num(r.total_returned),
     total_adjusted: num(r.total_adjusted),
     current_stock,
-    stock_value:    Math.round(current_stock * unit_cost * 100) / 100,
+    /* 480 ml is four bottles and a bit; both readings are useful and the
+       page should not have to guess the pack size to work one out. */
+    current_packs:  toPacks(current_stock, r),
+    stock_value:    round(current_stock * unit_cost, 2),
     state:          stockState(current_stock, r.reorder_level),
   };
 }
@@ -81,12 +87,19 @@ function shapeItem(r) {
  * these two functions.
  */
 function numericItem(r) {
-  return {
+  const item = {
     ...r,
     reorder_level: num(r.reorder_level),
     reorder_qty:   num(r.reorder_qty),
     unit_cost:     num(r.unit_cost),
+    pack_size:     packSize(r),
   };
+  /* The invoice figure, sent alongside the per-unit one. The page shows
+     and edits the pack cost — 9,000 a bottle — because that is what the
+     delivery note says; deriving it in one place stops each screen doing
+     the multiplication itself and rounding it differently. */
+  item.pack_cost = packCost(item);
+  return item;
 }
 
 /** A trimmed string, or null — so a cleared form field clears the column. */
@@ -173,7 +186,7 @@ router.get('/items/:id', async (req, res) => {
 
     const { rows: movements } = await pool.query(`
       SELECT l.id, l.type, l.quantity, TO_CHAR(l.date,'YYYY-MM-DD') AS date,
-             l.notes, l.reference, l.party, l.unit_cost, l.count_id, l.created_at,
+             l.notes, l.reference, l.party, l.unit_cost, l.cost, l.count_id, l.created_at,
              u.username AS recorded_by,
              SUM(${signedQty('l')}) OVER (ORDER BY l.date, l.id) AS running_balance
       FROM inventory_logs l
@@ -187,8 +200,13 @@ router.get('/items/:id', async (req, res) => {
       ...shapeItem(rows[0]),
       movements: movements.map(m => ({
         ...m,
-        quantity: num(m.quantity),
+        quantity:  num(m.quantity),
+        packs:     toPacks(m.quantity, rows[0]),
         unit_cost: m.unit_cost === null ? null : num(m.unit_cost),
+        /* Rows filed before movements were costed carry no rate. Falling
+           back to today's would put a confident figure on a dose whose
+           price nobody recorded, so they stay null and read as "—". */
+        cost:      m.cost === null ? null : num(m.cost),
         running_balance: num(m.running_balance),
       })),
     });
@@ -200,21 +218,35 @@ router.post('/items', async (req, res) => {
   if (!name) return res.status(400).json({ error: 'Name is required' });
 
   const category = CATEGORIES.includes(req.body.category) ? req.body.category : 'general';
-  const opening  = num(req.body.opening_stock);
+  const pack     = num(req.body.pack_size) > 0 ? num(req.body.pack_size) : 1;
+
+  /* The form offers whichever price the user actually has in front of
+     them: the invoice figure for a pack, or a per-unit rate. Both land in
+     the same column, because the ledger only ever costs base units. */
+  const unitCost = 'pack_cost' in req.body && req.body.pack_cost !== ''
+    ? round(num(req.body.pack_cost) / pack, 6)
+    : num(req.body.unit_cost);
+
+  /* Opening stock is entered in whichever unit was counted. A store
+     keeper counting the medicine shelf writes "3 bottles", not "300". */
+  const opening = req.body.opening_in_packs
+    ? toBase(req.body.opening_stock, { pack_size: pack })
+    : num(req.body.opening_stock);
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(`
       INSERT INTO inventory_items
-        (name, code, category, unit, notes, supplier, location,
+        (name, code, category, unit, pack_unit, pack_size, notes, supplier, location,
          reorder_level, reorder_qty, unit_cost)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       RETURNING ${ITEM_RETURNING}
     `, [
       name, text(req.body.code), category, text(req.body.unit) || 'pcs',
+      text(req.body.pack_unit), pack,
       text(req.body.notes), text(req.body.supplier), text(req.body.location),
-      num(req.body.reorder_level), num(req.body.reorder_qty), num(req.body.unit_cost),
+      num(req.body.reorder_level), num(req.body.reorder_qty), unitCost,
     ]);
 
     /* Opening stock is a real receipt, not a column on the item.
@@ -222,10 +254,12 @@ router.post('/items', async (req, res) => {
        from a figure that has a date and an author attached to it. */
     if (opening > 0) {
       await client.query(`
-        INSERT INTO inventory_logs (item_id, type, quantity, date, notes, unit_cost, created_by)
-        VALUES ($1, 'in', $2, COALESCE($3::date, CURRENT_DATE), 'Opening stock', $4, $5)
+        INSERT INTO inventory_logs
+          (item_id, type, quantity, date, notes, unit_cost, cost, created_by)
+        VALUES ($1, 'in', $2, COALESCE($3::date, CURRENT_DATE), 'Opening stock', $4, $5, $6)
       `, [rows[0].id, opening, parseDate(req.body.opening_date) || null,
-          num(req.body.unit_cost) || null, req.user?.id ?? null]);
+          unitCost || null, unitCost ? lineCost(opening, unitCost) : null,
+          req.user?.id ?? null]);
     }
 
     await client.query('COMMIT');
@@ -270,9 +304,31 @@ router.patch('/items/:id', async (req, res) => {
   for (const col of ['code', 'notes', 'supplier', 'location']) {
     if (col in req.body) set(col, text(req.body[col]));
   }
-  for (const col of ['reorder_level', 'reorder_qty', 'unit_cost']) {
+  for (const col of ['reorder_level', 'reorder_qty']) {
     if (col in req.body) set(col, num(req.body[col]));
   }
+  if ('pack_unit' in req.body) set('pack_unit', text(req.body.pack_unit));
+
+  /* Changing the pack size re-expresses the same shelf in the same base
+     units — 100 ml is 100 ml whether the label calls it one bottle or
+     two half-bottles — so no stock moves and no movement is rewritten.
+     The cost per base unit is held steady across the change for the same
+     reason: it is the pack price that has to follow the new size, not
+     the value of what is already on the shelf. */
+  const newPack = 'pack_size' in req.body && num(req.body.pack_size) > 0
+    ? num(req.body.pack_size) : null;
+  if (newPack) set('pack_size', newPack);
+
+  if ('pack_cost' in req.body && req.body.pack_cost !== '') {
+    const { rows: [cur] } = await pool.query(
+      'SELECT pack_size FROM inventory_items WHERE id = $1', [req.params.id]
+    );
+    if (!cur) return res.status(404).json({ error: 'Item not found' });
+    set('unit_cost', round(num(req.body.pack_cost) / (newPack ?? packSize(cur)), 6));
+  } else if ('unit_cost' in req.body) {
+    set('unit_cost', num(req.body.unit_cost));
+  }
+
   if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
 
   sets.push('updated_at = NOW()');
@@ -365,8 +421,8 @@ router.get('/logs', async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT l.id, l.item_id, l.type, l.quantity, TO_CHAR(l.date,'YYYY-MM-DD') AS date,
-             l.notes, l.reference, l.party, l.unit_cost, l.count_id, l.created_at,
-             i.name AS item_name, i.unit, i.category,
+             l.notes, l.reference, l.party, l.unit_cost, l.cost, l.count_id, l.created_at,
+             i.name AS item_name, i.unit, i.pack_unit, i.pack_size, i.category,
              u.username AS recorded_by
       FROM inventory_logs l
       JOIN inventory_items i ON i.id = l.item_id
@@ -377,8 +433,11 @@ router.get('/logs', async (req, res) => {
     `, params);
     res.json(rows.map(r => ({
       ...r,
-      quantity: num(r.quantity),
+      quantity:  num(r.quantity),
+      pack_size: packSize(r),
+      packs:     toPacks(r.quantity, r),
       unit_cost: r.unit_cost === null ? null : num(r.unit_cost),
+      cost:      r.cost === null ? null : num(r.cost),
     })));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -397,7 +456,6 @@ router.get('/logs', async (req, res) => {
  */
 router.post('/logs', async (req, res) => {
   const { item_id, type, date } = req.body;
-  const quantity = num(req.body.quantity);
 
   if (!item_id || !type || !date) {
     return res.status(400).json({ error: 'Item, movement type and date are required' });
@@ -410,9 +468,6 @@ router.post('/logs', async (req, res) => {
   if (!TYPES.includes(type)) {
     return res.status(400).json({ error: `Movement type must be one of: in, out, damage, return` });
   }
-  if (!(quantity > 0)) {
-    return res.status(400).json({ error: 'Quantity must be greater than zero' });
-  }
   const when = parseDate(date);
   if (!when) return res.status(400).json({ error: 'Date could not be read' });
 
@@ -420,7 +475,8 @@ router.post('/logs', async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: [item] } = await client.query(
-      'SELECT id, name, unit, status FROM inventory_items WHERE id = $1 FOR UPDATE', [item_id]
+      `SELECT id, name, unit, pack_unit, pack_size, unit_cost, status
+       FROM inventory_items WHERE id = $1 FOR UPDATE`, [item_id]
     );
     if (!item) {
       await client.query('ROLLBACK');
@@ -431,6 +487,19 @@ router.post('/logs', async (req, res) => {
       return res.status(409).json({ error: `${item.name} is archived. Restore it before booking stock in.` });
     }
 
+    /* A delivery is counted in packs — "5 bottles" — and a dose is drawn
+       in base units — "20 ml". The caller says which it typed; the ledger
+       only ever stores base units, so the conversion happens once, here,
+       rather than in each screen that can file a movement. */
+    const quantity = req.body.in_packs
+      ? toBase(req.body.quantity, item)
+      : num(req.body.quantity);
+
+    if (!(quantity > 0)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Quantity must be greater than zero' });
+    }
+
     const onHand = await onHandFor(client, item_id);
     const short  = shortfallMessage({ type, quantity, onHand, name: item.name, unit: item.unit });
     if (short) {
@@ -438,34 +507,66 @@ router.post('/logs', async (req, res) => {
       return res.status(409).json({ error: short, on_hand: onHand });
     }
 
+    /* What this movement is worth.
+
+       A delivery is priced by whoever booked it in, as a pack price off
+       the invoice or a rate per base unit. Everything going the other way
+       is costed at the item's prevailing average — nobody types what a
+       dose is worth, and asking them to would be asking them to do the
+       division the store keeps this figure for.
+
+       The rate is written onto the row. That is the whole point: it is
+       what the stock was worth when it moved, and re-deriving it later
+       would reprice every past treatment the next time a delivery landed
+       at a different price. */
+    const priced = 'pack_cost' in req.body && req.body.pack_cost !== ''
+      ? round(num(req.body.pack_cost) / packSize(item), 6)
+      : req.body.unit_cost === undefined || req.body.unit_cost === ''
+        ? null
+        : num(req.body.unit_cost);
+
+    const rate = type === 'in'
+      ? (priced ?? num(item.unit_cost))
+      : num(item.unit_cost);
+
     const { rows } = await client.query(`
       INSERT INTO inventory_logs
-        (item_id, type, quantity, date, notes, reference, party, unit_cost, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        (item_id, type, quantity, date, notes, reference, party, unit_cost, cost, created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING id, item_id, type, quantity, TO_CHAR(date,'YYYY-MM-DD') AS date,
-                notes, reference, party, unit_cost
+                notes, reference, party, unit_cost, cost
     `, [
       item_id, type, quantity, when, text(req.body.notes), text(req.body.reference),
       text(req.body.party),
-      req.body.unit_cost === undefined || req.body.unit_cost === '' ? null : num(req.body.unit_cost),
+      rate > 0 ? rate : null,
+      rate > 0 ? lineCost(quantity, rate) : null,
       req.user?.id ?? null,
     ]);
 
-    /* A delivery that came in at a new price updates the item's cost, so
-       the value of what is on the shelf reflects what it actually cost
-       rather than whatever was typed when the item was first created. */
-    if (type === 'in' && num(req.body.unit_cost) > 0) {
+    /* A priced delivery moves the item's average — see averageCost() for
+       why an average rather than simply the latest invoice. */
+    let newCost = num(item.unit_cost);
+    if (type === 'in' && priced > 0) {
+      newCost = averageCost({
+        onHand, currentCost: item.unit_cost, receivedQty: quantity, receivedCost: priced,
+      });
       await client.query(
         'UPDATE inventory_items SET unit_cost = $1, updated_at = NOW() WHERE id = $2',
-        [num(req.body.unit_cost), item_id]
+        [newCost, item_id]
       );
     }
 
     await client.query('COMMIT');
+    const after = type === 'in' || type === 'return' ? onHand + quantity : onHand - quantity;
     res.status(201).json({
       ...rows[0],
       quantity: num(rows[0].quantity),
-      balance_after: type === 'in' || type === 'return' ? onHand + quantity : onHand - quantity,
+      unit_cost: rows[0].unit_cost === null ? null : num(rows[0].unit_cost),
+      cost: rows[0].cost === null ? null : num(rows[0].cost),
+      balance_after: round(after, 3),
+      packs_after:   toPacks(after, item),
+      item_unit_cost: newCost,
+      item_pack_cost: packCost({ pack_size: packSize(item), unit_cost: newCost }),
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -538,7 +639,9 @@ router.get('/counts', async (req, res) => {
              c.status, c.notes, c.created_at, c.posted_at,
              cu.username AS counted_by, pu.username AS posted_by,
              COUNT(cl.id)::int AS lines,
-             COUNT(cl.id) FILTER (WHERE cl.book_qty IS NOT NULL AND cl.counted_qty <> cl.book_qty)::int AS variances
+             COUNT(cl.id) FILTER (WHERE cl.counted_qty IS NOT NULL)::int AS counted,
+             COUNT(cl.id) FILTER (WHERE cl.book_qty IS NOT NULL AND cl.counted_qty IS NOT NULL
+                                    AND cl.counted_qty <> cl.book_qty)::int AS variances
       FROM inventory_counts c
       LEFT JOIN inventory_count_lines cl ON cl.count_id = c.id
       LEFT JOIN users cu ON cu.id = c.counted_by
@@ -575,7 +678,7 @@ router.get('/counts/:id', async (req, res) => {
 
     const { rows: lines } = await pool.query(`
       SELECT cl.id, cl.item_id, cl.counted_qty, cl.book_qty, cl.notes,
-             i.name, i.unit, i.category, i.unit_cost,
+             i.name, i.unit, i.pack_unit, i.pack_size, i.category, i.unit_cost,
              ${balance('l')} AS live_book_qty
       FROM inventory_count_lines cl
       JOIN inventory_items i ON i.id = cl.item_id
@@ -589,14 +692,19 @@ router.get('/counts/:id', async (req, res) => {
       ...count,
       lines: lines.map(l => {
         const book = count.status === 'posted' ? num(l.book_qty) : num(l.live_book_qty);
+        const isCounted = l.counted_qty !== null;
         const counted = num(l.counted_qty);
+        const variance = isCounted ? round(counted - book, 3) : 0;
         return {
           ...l,
-          counted_qty: counted,
+          counted,
+          counted_qty: isCounted ? counted : null,
           book_qty: book,
+          pack_size: packSize(l),
+          book_packs: toPacks(book, l),
           unit_cost: num(l.unit_cost),
-          variance: Math.round((counted - book) * 1000) / 1000,
-          variance_value: Math.round((counted - book) * num(l.unit_cost) * 100) / 100,
+          variance,
+          variance_value: round(variance * num(l.unit_cost), 2),
         };
       }),
     });
@@ -629,9 +737,10 @@ router.post('/counts', async (req, res) => {
       : (await client.query("SELECT id FROM inventory_items WHERE status = 'active' ORDER BY category, name")).rows.map(r => r.id);
 
     for (const itemId of ids) {
+      /* NULL, not 0 — nobody has been to the shelf yet. */
       await client.query(
         `INSERT INTO inventory_count_lines (count_id, item_id, counted_qty)
-         VALUES ($1,$2,0) ON CONFLICT (count_id, item_id) DO NOTHING`,
+         VALUES ($1,$2,NULL) ON CONFLICT (count_id, item_id) DO NOTHING`,
         [count.id, itemId]
       );
     }
@@ -673,12 +782,16 @@ router.patch('/counts/:id', async (req, res) => {
 
     for (const line of req.body.lines || []) {
       if (!line.item_id) continue;
+      /* An empty box is "not counted", which is different from a zero
+         somebody actually wrote down after looking at an empty shelf. */
+      const counted = line.counted_qty === null || line.counted_qty === undefined || line.counted_qty === ''
+        ? null : num(line.counted_qty);
       await client.query(`
         INSERT INTO inventory_count_lines (count_id, item_id, counted_qty, notes)
         VALUES ($1,$2,$3,$4)
         ON CONFLICT (count_id, item_id)
         DO UPDATE SET counted_qty = EXCLUDED.counted_qty, notes = EXCLUDED.notes
-      `, [req.params.id, line.item_id, num(line.counted_qty), text(line.notes)]);
+      `, [req.params.id, line.item_id, counted, text(line.notes)]);
     }
 
     await client.query('COMMIT');
@@ -720,7 +833,7 @@ router.post('/counts/:id/post', async (req, res) => {
     }
 
     const { rows: lines } = await client.query(`
-      SELECT cl.id, cl.item_id, cl.counted_qty, i.name, i.unit
+      SELECT cl.id, cl.item_id, cl.counted_qty, i.name, i.unit, i.unit_cost
       FROM inventory_count_lines cl
       JOIN inventory_items i ON i.id = cl.item_id
       WHERE cl.count_id = $1
@@ -731,25 +844,45 @@ router.post('/counts/:id/post', async (req, res) => {
       return res.status(400).json({ error: 'This count has no lines to post.' });
     }
 
+    const counted = lines.filter(l => l.counted_qty !== null);
+    if (!counted.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Nothing on this count has been counted yet, so there is nothing to post.',
+      });
+    }
+
     const adjustments = [];
-    for (const line of lines) {
+    const skipped = lines.length - counted.length;
+    for (const line of counted) {
       const book     = await onHandFor(client, line.item_id);
       const counted  = num(line.counted_qty);
-      const variance = Math.round((counted - book) * 1000) / 1000;
+      const variance = round(counted - book, 3);
 
       await client.query('UPDATE inventory_count_lines SET book_qty = $1 WHERE id = $2', [book, line.id]);
       if (variance === 0) continue;
 
+      /* An adjustment is valued like any other movement: stock found or
+         lost is worth what the shelf it came off was worth. The sign
+         follows the variance, so a shortage reads as a cost. */
+      const rate = num(line.unit_cost);
       await client.query(`
-        INSERT INTO inventory_logs (item_id, type, quantity, date, notes, reference, created_by, count_id)
-        VALUES ($1,'adjust',$2,$3,$4,$5,$6,$7)
+        INSERT INTO inventory_logs
+          (item_id, type, quantity, date, notes, reference, unit_cost, cost, created_by, count_id)
+        VALUES ($1,'adjust',$2,$3,$4,$5,$6,$7,$8,$9)
       `, [
         line.item_id, variance, count.count_date,
         `Stock count ${count.ref}: book ${book}, counted ${counted}`,
-        count.ref, req.user?.id ?? null, count.id,
+        count.ref,
+        rate > 0 ? rate : null,
+        rate > 0 ? round(variance * rate, 2) : null,
+        req.user?.id ?? null, count.id,
       ]);
 
-      adjustments.push({ item: line.name, unit: line.unit, book, counted, variance });
+      adjustments.push({
+        item: line.name, unit: line.unit, book, counted, variance,
+        value: rate > 0 ? round(variance * rate, 2) : null,
+      });
     }
 
     await client.query(
@@ -757,7 +890,14 @@ router.post('/counts/:id/post', async (req, res) => {
       [req.user?.id ?? null, req.params.id]
     );
     await client.query('COMMIT');
-    res.json({ ok: true, ref: count.ref, lines: lines.length, adjustments });
+    res.json({
+      ok: true, ref: count.ref,
+      lines: lines.length, counted: counted.length,
+      /* Lines nobody got to. They keep whatever the book says and can be
+         picked up by the next count. */
+      not_counted: skipped,
+      adjustments,
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -802,16 +942,20 @@ router.get('/summary', async (req, res) => {
   try {
     const [items, period] = await Promise.all([
       pool.query(`
-        SELECT i.id, i.name, i.unit, i.category, i.unit_cost, i.reorder_level, i.reorder_qty,
+        SELECT i.id, i.name, i.unit, i.pack_unit, i.pack_size, i.category,
+               i.unit_cost, i.reorder_level, i.reorder_qty,
                ${balance('l')} AS current_stock
         FROM inventory_items i
         LEFT JOIN inventory_logs l ON l.item_id = i.id
         WHERE i.status = 'active'
         GROUP BY i.id
       `),
+      /* COALESCE down to the item's rate for rows filed before movements
+         carried a cost of their own — otherwise a store with a year of
+         history reports nothing spent until the day this shipped. */
       pool.query(`
         SELECT l.type, COALESCE(SUM(l.quantity), 0) AS qty,
-               COALESCE(SUM(l.quantity * COALESCE(l.unit_cost, i.unit_cost)), 0) AS value
+               COALESCE(SUM(COALESCE(l.cost, l.quantity * COALESCE(l.unit_cost, i.unit_cost))), 0) AS value
         FROM inventory_logs l
         JOIN inventory_items i ON i.id = l.item_id
         WHERE l.date BETWEEN $1 AND $2
@@ -844,11 +988,16 @@ router.get('/summary', async (req, res) => {
       low_stock:    rows.filter(r => r.state === 'low').length,
       period: {
         received:  of('in').qty,
-        received_value: Math.round(of('in').value * 100) / 100,
+        received_value: round(of('in').value, 2),
         returned:  of('return').qty,
         issued:    of('out').qty,
+        /* What the store spent on what it actually used, as opposed to
+           what it spent restocking. For the veterinary shelf this is the
+           cost of the medicines that went into animals this month. */
+        issued_value: round(of('out').value, 2),
         damaged:   of('damage').qty,
-        damaged_value: Math.round(of('damage').value * 100) / 100,
+        damaged_value: round(of('damage').value, 2),
+        consumed_value: round(of('out').value + of('damage').value, 2),
         adjusted:  of('adjust').qty,
         damage_rate: consumed > 0 ? Math.round((of('damage').qty / consumed) * 1000) / 10 : 0,
       },
@@ -858,12 +1007,21 @@ router.get('/summary', async (req, res) => {
         .filter(r => r.state !== 'ok')
         .sort((a, b) => (a.current_stock - a.reorder_level) - (b.current_stock - b.reorder_level))
         .slice(0, 20)
-        .map(r => ({
-          id: r.id, name: r.name, unit: r.unit, category: r.category,
-          current_stock: r.current_stock, reorder_level: r.reorder_level,
-          suggested_order: Math.max(r.reorder_qty, Math.max(0, r.reorder_level - r.current_stock)),
-          state: r.state,
-        })),
+        .map(r => {
+          const order = Math.max(r.reorder_qty, Math.max(0, r.reorder_level - r.current_stock));
+          return {
+            id: r.id, name: r.name, unit: r.unit, category: r.category,
+            pack_unit: r.pack_unit, pack_size: packSize(r),
+            current_stock: r.current_stock, reorder_level: r.reorder_level,
+            suggested_order: order,
+            /* An order is placed in packs — you ask the supplier for six
+               bottles, not for 600 ml — so the sheet says how many, and
+               rounds up: half a bottle is not orderable. */
+            suggested_packs: r.pack_unit ? Math.ceil(toPacks(order, r)) : null,
+            estimated_cost:  round(order * r.unit_cost, 2),
+            state: r.state,
+          };
+        }),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -890,13 +1048,17 @@ router.get('/report', async (req, res) => {
 
   try {
     const { rows } = await pool.query(`
-      SELECT i.id, i.name, i.unit, i.category, i.unit_cost, i.reorder_level, i.status,
+      SELECT i.id, i.name, i.unit, i.pack_unit, i.pack_size, i.category,
+             i.unit_cost, i.reorder_level, i.status,
              COALESCE(SUM(CASE WHEN l.date <  $1 THEN ${signedQty('l')} ELSE 0 END), 0) AS opening,
              COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'in'     THEN l.quantity ELSE 0 END), 0) AS received,
              COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'return' THEN l.quantity ELSE 0 END), 0) AS returned,
              COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'out'    THEN l.quantity ELSE 0 END), 0) AS issued,
              COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'damage' THEN l.quantity ELSE 0 END), 0) AS damaged,
-             COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'adjust' THEN l.quantity ELSE 0 END), 0) AS adjusted
+             COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'adjust' THEN l.quantity ELSE 0 END), 0) AS adjusted,
+             COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'in'     THEN COALESCE(l.cost, l.quantity * COALESCE(l.unit_cost, i.unit_cost)) ELSE 0 END), 0) AS received_cost,
+             COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'out'    THEN COALESCE(l.cost, l.quantity * COALESCE(l.unit_cost, i.unit_cost)) ELSE 0 END), 0) AS issued_cost,
+             COALESCE(SUM(CASE WHEN l.date BETWEEN $1 AND $2 AND l.type = 'damage' THEN COALESCE(l.cost, l.quantity * COALESCE(l.unit_cost, i.unit_cost)) ELSE 0 END), 0) AS damaged_cost
       FROM inventory_items i
       LEFT JOIN inventory_logs l ON l.item_id = i.id AND l.date <= $2
       WHERE (i.status = 'active' OR EXISTS (
@@ -914,29 +1076,45 @@ router.get('/report', async (req, res) => {
       const issued   = num(r.issued);
       const damaged  = num(r.damaged);
       const adjusted = num(r.adjusted);
-      const closing  = Math.round((opening + received + returned - issued - damaged + adjusted) * 1000) / 1000;
+      const closing  = round(opening + received + returned - issued - damaged + adjusted, 3);
       const consumed = issued + damaged;
       const unitCost = num(r.unit_cost);
+      /* Costs come from the movements, each carrying the rate that stood
+         when it happened — not from closing × today's price, which would
+         restate every past period the next time a delivery moved the
+         average. Only closing_value uses the current rate, because that
+         is what the shelf is worth now. */
+      const issuedCost  = round(num(r.issued_cost), 2);
+      const damagedCost = round(num(r.damaged_cost), 2);
       return {
         id: r.id, name: r.name, unit: r.unit, category: r.category, status: r.status,
-        unit_cost: unitCost, reorder_level: num(r.reorder_level),
+        pack_unit: r.pack_unit, pack_size: packSize(r),
+        unit_cost: unitCost, pack_cost: packCost(r), reorder_level: num(r.reorder_level),
         opening, received, returned, issued, damaged, adjusted, closing,
-        closing_value: Math.round(closing * unitCost * 100) / 100,
-        damaged_value: Math.round(damaged * unitCost * 100) / 100,
+        closing_packs: toPacks(closing, r),
+        closing_value: round(closing * unitCost, 2),
+        received_value: round(num(r.received_cost), 2),
+        issued_value:   issuedCost,
+        damaged_value:  damagedCost,
+        consumed_value: round(issuedCost + damagedCost, 2),
         damage_rate: consumed > 0 ? Math.round((damaged / consumed) * 1000) / 10 : 0,
         state: stockState(closing, r.reorder_level),
       };
     });
 
-    const sum = (k) => Math.round(report.reduce((t, r) => t + r[k], 0) * 1000) / 1000;
+    const sum   = (k) => round(report.reduce((t, r) => t + r[k], 0), 3);
+    const money = (k) => round(report.reduce((t, r) => t + r[k], 0), 2);
     res.json({
       from, to,
       rows: report,
       totals: {
         received: sum('received'), returned: sum('returned'),
         issued: sum('issued'), damaged: sum('damaged'), adjusted: sum('adjusted'),
-        closing_value: Math.round(report.reduce((t, r) => t + r.closing_value, 0) * 100) / 100,
-        damaged_value: Math.round(report.reduce((t, r) => t + r.damaged_value, 0) * 100) / 100,
+        closing_value:  money('closing_value'),
+        received_value: money('received_value'),
+        issued_value:   money('issued_value'),
+        damaged_value:  money('damaged_value'),
+        consumed_value: money('consumed_value'),
       },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -955,9 +1133,17 @@ const COLUMN = {
   category:  ['category', 'group', 'type of item'],
   type:      ['type', 'movement', 'movement type', 'in/out'],
   quantity:  ['quantity', 'qty', 'units', 'amount'],
+  /* A separate column, deliberately. "Qty 4" beside "UOM: ml" means four
+     millilitres; a sheet that means four vials has to say so, or a
+     delivery of four 20 ml vials imports as four millilitres and the
+     shelf is short by a factor of twenty with nothing to show for it. */
+  packs:     ['packs', 'qty in packs', 'packs received', 'containers', 'bottles', 'no. of packs'],
   date:      ['date', 'day'],
   unit:      ['unit', 'uom', 'units of measure'],
   cost:      ['unit cost', 'unit_cost', 'cost', 'price', 'rate'],
+  packCost:  ['pack cost', 'pack price', 'bottle price', 'price per pack'],
+  packSize:  ['pack size', 'pack_size', 'per pack', 'units per pack', 'content', 'volume'],
+  packUnit:  ['pack unit', 'pack', 'container', 'bought as'],
   reference: ['reference', 'ref', 'invoice', 'delivery note', 'grn'],
   party:     ['supplier', 'party', 'issued to', 'from', 'vendor'],
   notes:     ['notes', 'remarks', 'comment', 'comments'],
@@ -1025,8 +1211,9 @@ router.post('/import', upload.single('file'), async (req, res) => {
 
     for (const row of rows) {
       rowNo++;
-      const name = String(pick(row, 'name') ?? '').trim();
-      const qty  = num(pick(row, 'quantity'));
+      const name  = String(pick(row, 'name') ?? '').trim();
+      const packs = pick(row, 'packs');
+      const qty   = packs !== undefined ? num(packs) : num(pick(row, 'quantity'));
       const date = parseDate(pick(row, 'date'));
       const type = readType(pick(row, 'type'));
 
@@ -1038,10 +1225,20 @@ router.post('/import', upload.single('file'), async (req, res) => {
       const rawCategory = String(pick(row, 'category') ?? '').trim().toLowerCase();
       parsed.push({
         rowNo, name, qty, date, type,
+        qtyInPacks: packs !== undefined,
         unit:      String(pick(row, 'unit') ?? 'pcs').trim() || 'pcs',
         code:      text(pick(row, 'code')),
         category:  CATEGORIES.includes(rawCategory) ? rawCategory : 'general',
-        cost:      pick(row, 'cost') === undefined ? null : num(pick(row, 'cost')),
+        /* A sheet that prices the bottle rather than the millilitre is the
+           normal case for veterinary stock, and reading 9,000 as the cost
+           of one millilitre would value the shelf at a hundred times what
+           the farm paid. */
+        cost:       pick(row, 'packCost') !== undefined ? num(pick(row, 'packCost'))
+                  : pick(row, 'cost')     !== undefined ? num(pick(row, 'cost'))
+                  : null,
+        costIsPack: pick(row, 'packCost') !== undefined,
+        packSize:   num(pick(row, 'packSize')) > 0 ? num(pick(row, 'packSize')) : 1,
+        packUnit:   text(pick(row, 'packUnit')),
         reference: text(pick(row, 'reference')),
         party:     text(pick(row, 'party')),
         notes:     text(pick(row, 'notes')),
@@ -1075,31 +1272,66 @@ router.post('/import', upload.single('file'), async (req, res) => {
           itemId = existing.id;
         } else {
           const { rows: [made] } = await client.query(`
-            INSERT INTO inventory_items (name, code, unit, category, unit_cost)
-            VALUES ($1,$2,$3,$4,$5) RETURNING id
-          `, [r.name, r.code, r.unit, r.category, r.cost ?? 0]);
+            INSERT INTO inventory_items
+              (name, code, unit, pack_unit, pack_size, category, unit_cost)
+            VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
+          `, [
+            r.name, r.code, r.unit, r.packUnit, r.packSize, r.category,
+            r.cost === null ? 0 : (r.costIsPack ? round(r.cost / r.packSize, 6) : r.cost),
+          ]);
           itemId = made.id;
           created++;
         }
         itemIds.set(r.name.toLowerCase(), itemId);
       }
 
+      const { rows: [state] } = await client.query(
+        'SELECT unit_cost, pack_size FROM inventory_items WHERE id = $1', [itemId]
+      );
+      const onHand = await onHandFor(client, itemId);
+
+      /* Packs to base units, now that the item's pack size is known —
+         which it may only be because this same row just created it. */
+      const qty = r.qtyInPacks ? toBase(r.qty, state) : r.qty;
+
       if (r.type === 'out' || r.type === 'damage') {
-        const onHand = await onHandFor(client, itemId);
-        if (r.qty > onHand) {
+        if (qty > onHand) {
           errors.push(
-            `Row ${r.rowNo}: ${r.name} — ${r.type === 'damage' ? 'writing off' : 'issuing'} ${r.qty} `
+            `Row ${r.rowNo}: ${r.name} — ${r.type === 'damage' ? 'writing off' : 'issuing'} ${qty} `
             + `would take the balance below zero (${onHand} on hand at that point). Skipped.`
           );
           continue;
         }
       }
 
+      /* Same rule as a movement typed into the page: a delivery carries
+         the price on the sheet, everything else is costed at the average
+         standing when it happened. A sheet priced per pack says so in its
+         own column, so the two are not silently mixed up. */
+      const sheetRate = r.cost === null ? null
+        : r.costIsPack ? round(num(r.cost) / packSize(state), 6)
+        : num(r.cost);
+      const rate = r.type === 'in' ? (sheetRate ?? num(state.unit_cost)) : num(state.unit_cost);
+
       await client.query(`
         INSERT INTO inventory_logs
-          (item_id, type, quantity, date, notes, reference, party, unit_cost, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      `, [itemId, r.type, r.qty, r.date, r.notes, r.reference, r.party, r.cost, req.user?.id ?? null]);
+          (item_id, type, quantity, date, notes, reference, party, unit_cost, cost, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      `, [
+        itemId, r.type, qty, r.date, r.notes, r.reference, r.party,
+        rate > 0 ? rate : null,
+        rate > 0 ? lineCost(qty, rate) : null,
+        req.user?.id ?? null,
+      ]);
+
+      if (r.type === 'in' && sheetRate > 0) {
+        await client.query(
+          'UPDATE inventory_items SET unit_cost = $1, updated_at = NOW() WHERE id = $2',
+          [averageCost({
+            onHand, currentCost: state.unit_cost, receivedQty: qty, receivedCost: sheetRate,
+          }), itemId]
+        );
+      }
       imported++;
     }
 
