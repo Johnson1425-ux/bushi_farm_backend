@@ -92,7 +92,7 @@ async function initDB() {
         id          SERIAL PRIMARY KEY,
         count_id    INTEGER NOT NULL REFERENCES inventory_counts(id) ON DELETE CASCADE,
         item_id     INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
-        counted_qty NUMERIC NOT NULL DEFAULT 0,
+        counted_qty NUMERIC,            -- NULL until somebody counts it
         book_qty    NUMERIC,
         notes       TEXT,
         UNIQUE (count_id, item_id)
@@ -353,6 +353,75 @@ async function initDB() {
 
         CREATE INDEX IF NOT EXISTS idx_inv_logs_type  ON inventory_logs(type);
         CREATE INDEX IF NOT EXISTS idx_inv_logs_count ON inventory_logs(count_id);
+      `],
+
+      /* Stock that is used out of an opened container.
+
+         A 100 ml bottle of oxytetracycline is priced as a bottle — 9,000
+         — and drawn as millilitres. With one unit per item the store had
+         to choose which of those to record, and either choice lost the
+         other: count bottles and a 20 ml dose is unrecordable; count
+         millilitres and nobody can enter the invoice.
+
+         So the ledger holds the base unit and the item says how many of
+         them are in a pack. pack_size defaults to 1, which is every item
+         bought and issued in the same unit — bottles of caps, crates —
+         and for those nothing about the arithmetic changes.
+
+         'medicine' joins the categories because veterinary stock is the
+         case this was built for and filing it under 'chemical' beside the
+         CIP caustic helps nobody looking for what a treatment cost. */
+      ['inventory_items pack columns', `
+        ALTER TABLE inventory_items
+          ADD COLUMN IF NOT EXISTS pack_unit TEXT,
+          ADD COLUMN IF NOT EXISTS pack_size NUMERIC NOT NULL DEFAULT 1;
+
+        UPDATE inventory_items SET pack_size = 1 WHERE pack_size IS NULL OR pack_size <= 0;
+
+        ALTER TABLE inventory_items DROP CONSTRAINT IF EXISTS inventory_items_pack_size_check;
+        ALTER TABLE inventory_items ADD CONSTRAINT inventory_items_pack_size_check
+          CHECK (pack_size > 0);
+
+        ALTER TABLE inventory_items DROP CONSTRAINT IF EXISTS inventory_items_category_check;
+        ALTER TABLE inventory_items ADD CONSTRAINT inventory_items_category_check
+          CHECK (category IN ('packaging','ingredient','medicine','chemical','spare','tool','ppe','general'));
+      `],
+
+      /* What a movement was worth when it happened.
+
+         unit_cost was already on the row but only a delivery ever filled
+         it in, so the ledger recorded what stock cost to buy and never
+         what it cost to use — and "what did we spend treating her" had no
+         answer in the data at all. Every movement is costed now, at the
+         average that stood at the moment it was recorded.
+
+         Stamped rather than derived on read. Prices move; pricing last
+         month's doses at this month's average would quietly change what a
+         treatment cost every time somebody opened the report. */
+      ['inventory_logs cost', `
+        ALTER TABLE inventory_logs
+          ADD COLUMN IF NOT EXISTS cost NUMERIC;
+
+        CREATE INDEX IF NOT EXISTS idx_inv_logs_date_type ON inventory_logs(date, type);
+      `],
+
+      /* A line nobody counted is not a line counted as zero.
+
+         Count lines were seeded at 0 and 0 meant "empty shelf", so a
+         store keeper who opened a count of forty items, wrote in the five
+         they had actually been to look at, and posted it would zero the
+         other thirty-five — and the confirmation would call it
+         thirty-five variances, which is technically what it said and
+         entirely the wrong thing to have agreed to.
+
+         NULL now means not yet counted, and posting skips those lines
+         rather than writing an adjustment against them. Existing rows are
+         left exactly as they are: a posted count is a record of what was
+         decided, and rewriting its lines to say something else would be
+         the same kind of quiet damage in the other direction. */
+      ['inventory_count_lines nullable count', `
+        ALTER TABLE inventory_count_lines ALTER COLUMN counted_qty DROP NOT NULL;
+        ALTER TABLE inventory_count_lines ALTER COLUMN counted_qty DROP DEFAULT;
       `],
 
       /* One upload per month, enforced rather than assumed: the upload route

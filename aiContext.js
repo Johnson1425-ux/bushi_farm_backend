@@ -450,7 +450,7 @@ async function customersContext({ from, to }) {
 async function inventoryContext({ from, to }) {
   const [stock, movements] = await Promise.all([
     pool.query(`
-      SELECT i.name, i.unit, i.category, i.notes, i.supplier,
+      SELECT i.name, i.unit, i.pack_unit, i.pack_size, i.category, i.notes, i.supplier,
              i.reorder_level, i.unit_cost,
              ROUND(${balance('l')}::numeric, 2) AS current_stock
       FROM inventory_items i
@@ -465,16 +465,19 @@ async function inventoryContext({ from, to }) {
        400" are different facts about the same month, and the second is the
        one worth asking a question about. */
     pool.query(`
-      SELECT i.name, i.unit,
+      SELECT i.name, i.unit, i.category,
              ROUND(SUM(CASE WHEN l.type = 'in'     THEN l.quantity ELSE 0 END)::numeric, 2) AS received,
              ROUND(SUM(CASE WHEN l.type = 'out'    THEN l.quantity ELSE 0 END)::numeric, 2) AS used,
+             ROUND(SUM(CASE WHEN l.type IN ('out','damage')
+                            THEN COALESCE(l.cost, l.quantity * COALESCE(l.unit_cost, i.unit_cost))
+                            ELSE 0 END)::numeric, 2) AS consumed_cost,
              ROUND(SUM(CASE WHEN l.type = 'damage' THEN l.quantity ELSE 0 END)::numeric, 2) AS damaged,
              ROUND(SUM(CASE WHEN l.type = 'return' THEN l.quantity ELSE 0 END)::numeric, 2) AS returned,
              ROUND(SUM(CASE WHEN l.type = 'adjust' THEN l.quantity ELSE 0 END)::numeric, 2) AS count_adjustments
       FROM inventory_logs l
       JOIN inventory_items i ON i.id = l.item_id
       WHERE l.date BETWEEN $1 AND $2
-      GROUP BY i.id, i.name, i.unit
+      GROUP BY i.id, i.name, i.unit, i.category
       ORDER BY used DESC
     `, [from, to]),
   ]);
@@ -485,6 +488,14 @@ async function inventoryContext({ from, to }) {
     category: r.category,
     current_stock: num(r.current_stock),
     reorder_level: num(r.reorder_level),
+    /* Both readings of the same shelf: 480 ml, which is 4.8 bottles. */
+    ...(num(r.pack_size) > 1 ? {
+      pack_unit: r.pack_unit,
+      pack_size: num(r.pack_size),
+      current_packs: Math.round((num(r.current_stock) / num(r.pack_size)) * 1000) / 1000,
+      cost_per_pack: Math.round(num(r.pack_size) * num(r.unit_cost) * 100) / 100,
+    } : {}),
+    cost_per_unit: num(r.unit_cost),
     stock_value: Math.round(num(r.current_stock) * num(r.unit_cost) * 100) / 100,
     supplier: r.supplier,
     notes: r.notes,
@@ -493,19 +504,38 @@ async function inventoryContext({ from, to }) {
   const periodRows = movements.rows.map(r => {
     const used = num(r.used), damaged = num(r.damaged);
     return {
-      name: r.name, unit: r.unit,
+      name: r.name, unit: r.unit, category: r.category,
       received: num(r.received), used, damaged,
       returned: num(r.returned),
       count_adjustments: num(r.count_adjustments),
+      /* What the stock that left the shelf was worth, costed at the rate
+         standing when each movement happened. This is the figure behind
+         "what did we spend on medicines" — the store's spending on what
+         it USED, as against what it spent restocking. */
+      consumed_cost: num(r.consumed_cost),
       damage_rate_pct: used + damaged > 0
         ? Math.round((damaged / (used + damaged)) * 1000) / 10
         : 0,
     };
   });
 
+  /* Grouped so a question about one shelf does not need the model to add
+     up forty rows and hope. Medicines are the shelf most often asked
+     about by cost rather than by quantity. */
+  const costByCategory = {};
+  for (const r of periodRows) {
+    costByCategory[r.category] = Math.round(
+      ((costByCategory[r.category] || 0) + r.consumed_cost) * 100
+    ) / 100;
+  }
+
   return {
     items,
     stock_value: Math.round(items.reduce((t, i) => t + i.stock_value, 0) * 100) / 100,
+    consumed_cost_in_period: Math.round(
+      periodRows.reduce((t, r) => t + r.consumed_cost, 0) * 100
+    ) / 100,
+    consumed_cost_by_category: costByCategory,
     out_of_stock: items.filter(i => i.current_stock <= 0).map(i => i.name),
     /* Below the level the store itself set for reordering — the list
        somebody has to act on, as opposed to the list of things that have
