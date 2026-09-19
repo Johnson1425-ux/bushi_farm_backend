@@ -64,7 +64,11 @@ const app = express();
 const corsOptions = {
   origin: ALLOWED_ORIGINS,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  /* X-Client-Platform is allowed through so that running the mobile app
+     in a browser during development does not fail preflight. It does not
+     let a page claim to be the native app: isNativeClient() also requires
+     the request to carry no Origin, and a browser always sends one. */
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Client-Platform'],
   credentials: true,
 };
 

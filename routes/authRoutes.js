@@ -14,6 +14,7 @@ const {
   setRefreshCookie, clearRefreshCookie, readRefreshCookie,
 } = require('../lib/sessionCookie');
 const { rejectForeignOrigin } = require('../lib/origins');
+const { isNativeClient } = require('../lib/nativeClient');
 
 const router = express.Router();
 
@@ -39,14 +40,35 @@ const router = express.Router();
 ══════════════════════════════════ */
 
 /**
- * Hand the client its session: the cookie on the response, the access
- * token in the body.
+ * Hand the client its session.
+ *
+ * A browser gets the refresh token as a cookie it cannot read and the
+ * access token in the body — the arrangement described above.
+ *
+ * The iOS app gets both in the body, because it has no cookie jar that
+ * survives a relaunch and does have the Keychain, which is a better place
+ * for a month-long credential than a cookie is. isNativeClient() is what
+ * decides, and lib/nativeClient.js explains why a page cannot pretend to
+ * be one.
  */
-async function sendSession(res, user, refresh) {
-  setRefreshCookie(res, refresh.token, REFRESH_DAYS);
+async function sendSession(res, user, refresh, req) {
+  const native = isNativeClient(req);
+
+  if (native) {
+    /* Belt and braces: a native client should have no cookie, but if one
+       was ever set on this response path it must not linger as a second,
+       staler copy of the session. */
+    clearRefreshCookie(res);
+  } else {
+    setRefreshCookie(res, refresh.token, REFRESH_DAYS);
+  }
+
   res.json({
     token: signAccessToken(user, { sid: refresh.familyId }),
     expiresIn: ACCESS_TTL_SECONDS,
+    ...(native
+      ? { refreshToken: refresh.token, refreshExpiresInDays: REFRESH_DAYS }
+      : {}),
     user: await withBranchName(user),
   });
 }
@@ -77,7 +99,7 @@ router.post('/login', rejectForeignOrigin, loginRateLimit, async (req, res) => {
       id: user.id, username: user.username,
       role: user.role, branch_id: user.branch_id ?? null,
     };
-    await sendSession(res, claims, await issueRefreshToken(user.id, { req }));
+    await sendSession(res, claims, await issueRefreshToken(user.id, { req }), req);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -96,10 +118,14 @@ router.post('/login', rejectForeignOrigin, loginRateLimit, async (req, res) => {
    row to join against and cannot refresh at all.
 ══════════════════════════════════ */
 router.post('/refresh', rejectForeignOrigin, async (req, res) => {
-  /* The cookie first. `refreshToken` in the body is accepted only to
-     carry over a session from the release that kept the token in
-     localStorage: the client sends what it had once, gets a cookie back,
-     and forgets it. Nothing hands out a token in a body any more. */
+  /* The cookie first, because for a browser it is the only credential
+     that counts.
+
+     `refreshToken` in the body serves two callers. The iOS app, which has
+     no cookie and presents the token it keeps in the Keychain — see
+     lib/nativeClient.js. And, still, a browser carrying over a session
+     from the release that kept the token in localStorage: it sends what
+     it had once, gets a cookie back, and forgets it. */
   const presented = readRefreshCookie(req) || req.body?.refreshToken;
   try {
     const result = await rotateRefreshToken(presented, { req });
@@ -110,7 +136,7 @@ router.post('/refresh', rejectForeignOrigin, async (req, res) => {
       clearRefreshCookie(res);
       return res.status(401).json({ error: result.error, code: 'refresh_rejected' });
     }
-    await sendSession(res, result.user, result);
+    await sendSession(res, result.user, result, req);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
