@@ -11,7 +11,7 @@ const {
 
 const aiRoutes         = require('./aiRoutes');
 const { initAiTables }  = require('./aiClient');
-const { initNewTables, initHealthRecordsTables } = require('./lib/initTables');
+const { initNewTables, initHealthRecordsTables, initCalvesTable } = require('./lib/initTables');
 const { initStockTables } = require('./lib/initStock');
 const { initPosTables }   = require('./lib/initPos');
 const { initCustomerTables } = require('./lib/initCustomers');
@@ -32,6 +32,7 @@ const diseasesRoutes    = require('./routes/diseases');
 const treatmentsRoutes  = require('./routes/treatments');
 const cowHistoryRoutes  = require('./routes/cowHistory');
 const pregnanciesRoutes = require('./routes/pregnancies');
+const calvesRoutes      = require('./routes/calves');
 const alertsRoutes      = require('./routes/alerts');
 const salesRoutes       = require('./routes/sales');
 const inventoryRoutes   = require('./routes/inventory');
@@ -74,7 +75,9 @@ app.use(express.json());
 
 /* Start the schema work now, so a warm process has it done already. */
 const initAllTables = () => Promise.all([
-  initAiTables(), initNewTables(), initHealthRecordsTables(), initExpenseTables(),
+  initAiTables(), initHealthRecordsTables(), initExpenseTables(),
+  /* calves references pregnancies, which initNewTables creates. */
+  initNewTables().then(initCalvesTable),
   /* Sessions live here. Spent and long-expired rows are swept on the way
      in — there is no scheduler on a serverless host, and a cold start is
      the one moment where a housekeeping query costs nothing anybody is
@@ -190,6 +193,9 @@ app.use('/api/users', verifyToken, requireAdmin, usersRoutes);
    cow-history endpoints nested under it belong to the vet side.
 ══════════════════════════════════ */
 app.use('/api/cows',      verifyToken, cowsRoutes);
+/* Same arrangement for the young stock: the vet and the manager both read
+   it, and routes/calves.js guards each write on its own. */
+app.use('/api/calves',    verifyToken, calvesRoutes);
 app.use('/api/analytics', verifyToken, analyticsRoutes);
 app.use('/api/alerts',    verifyToken, alertsRoutes);
 
