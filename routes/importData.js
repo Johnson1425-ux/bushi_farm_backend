@@ -64,7 +64,7 @@ router.post('/', upload.single('file'), async (req, res) => {
         /* The grid ends in totals and averages rows that have no cow name of
            their own but do carry figures. Anything below the last named row
            is footer, not another animal. */
-        if (/^(TOTAL|AVERAGE|AVG|GRAND TOTAL|SUM)\b/i.test(cowName)) continue;
+        if (/^(TOTAL|AVERAGE|AVG|GRAND TOTAL|SUM|NDAMA|SHOP)\b/i.test(cowName)) continue;
         cowsSeen.add(cowName);
         const cowRes = await client.query(
           `INSERT INTO cows(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING id`,

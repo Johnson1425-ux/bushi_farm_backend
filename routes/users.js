@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt  = require('bcrypt');
 const { pool } = require('../db');
 const { ROLES } = require('../auth');
+const { revokeAllForUser } = require('../lib/refreshTokens');
 
 const router = express.Router();
 
@@ -87,6 +88,12 @@ router.patch('/:id', async (req, res) => {
       [role, branch.branch_id, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    /* End their sessions. A refresh remints the access token from this row,
+       so a demotion would take hold on its own within a few minutes — but
+       "within a few minutes" is not what an admin taking someone's access
+       away is asking for, and an attendant moved to another branch should
+       not be part-way through a shift on the old one. */
+    await revokeAllForUser(rows[0].id);
     res.json(rows[0]);
   } catch (err) {
     if (err.code === '23503') return res.status(400).json({ error: 'That branch does not exist' });
@@ -100,6 +107,9 @@ router.patch('/:id/password', async (req, res) => {
   try {
     const hash = await bcrypt.hash(password, 10);
     await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.params.id]);
+    /* A new password has to end the old sessions, or resetting it after a
+       laptop goes missing changes nothing for whoever has the laptop. */
+    await revokeAllForUser(parseInt(req.params.id, 10));
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

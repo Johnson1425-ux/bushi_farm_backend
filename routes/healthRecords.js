@@ -1,8 +1,9 @@
 const express = require('express');
 const multer  = require('multer');
-const mammoth = require('mammoth');
 const { pool } = require('../db');
-const { parseHealthDoc } = require('../lib/parsers');
+const { parseHealthDocx } = require('../lib/healthRecordParser');
+const { COLUMNS, normaliseRecord, valueFor } = require('../lib/healthRecordForm');
+const { buildHealthRecordTemplate } = require('../lib/healthRecordTemplate');
 
 const router = express.Router();
 const upload = multer({
@@ -11,6 +12,61 @@ const upload = multer({
 });
 
 // NOTE: mounted in server.js as `app.use('/api/health-records', verifyToken, requireHealth, healthRecordsRouter)`.
+
+/* ─── shared write path ───────────────────────────────────────
+   A record reaches the table two ways — typed into the in-app form, or
+   parsed out of an uploaded .docx — and both write the same columns. They
+   build their SQL from the same COLUMNS list rather than from two
+   hand-written parameter lists, because the hand-written pair is what let
+   a field be added to one path and forgotten in the other. */
+
+function insertSql(extraColumns = []) {
+  const cols = [...COLUMNS, ...extraColumns];
+  const ph   = cols.map((_, i) => `$${i + 1}`).join(',');
+  return `INSERT INTO cow_health_records (${cols.join(',')}) VALUES (${ph})
+          RETURNING id, cow_id, cow_tag, exam_date, final_diagnosis, uploaded_at`;
+}
+
+function insertValues(record, extras = []) {
+  return [...COLUMNS.map(c => valueFor(record, c)), ...extras];
+}
+
+/**
+ * The cow this record belongs to.
+ *
+ * An explicit choice in the form wins. Failing that the tag written on the
+ * sheet is matched against the herd, so an uploaded form finds its cow
+ * without anyone picking it from a list. A tag that matches nothing leaves
+ * the record unlinked rather than attached to the wrong animal — the list
+ * shows it as "Unlinked" and it can be edited afterwards.
+ */
+async function resolveCowId(explicitId, tag) {
+  if (explicitId) {
+    const id = parseInt(explicitId, 10);
+    if (Number.isInteger(id)) return id;
+  }
+  if (!tag) return null;
+  const { rows } = await pool.query(
+    `SELECT id FROM cows WHERE tag = $1 OR UPPER(name) = UPPER($1) LIMIT 1`,
+    [tag]
+  );
+  return rows.length ? rows[0].id : null;
+}
+
+/* GET /template — the blank form, as a Word document.
+
+   Declared above `/:id` so the router does not read "template" as a
+   record id. */
+router.get('/template', async (req, res) => {
+  try {
+    const buffer = await buildHealthRecordTemplate();
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition',
+      'attachment; filename="Bushi Dairy Farm Individual Health Record.docx"');
+    res.send(buffer);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 /* GET /  — list all (optionally by cow) */
 router.get('/', async (req, res) => {
@@ -48,7 +104,59 @@ router.get('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/* POST /import  — upload .docx */
+/* POST /  — save a form filled in the app.
+
+   The sheet is an examination record, so the one thing it cannot be
+   missing is which animal was examined: either a cow picked from the herd
+   or the tag written at the top. Everything else on the form is a finding,
+   and a finding the vet did not record is a blank, not an error. */
+router.post('/', async (req, res) => {
+  const record = normaliseRecord(req.body);
+  const cow_id = await resolveCowId(req.body.cow_id, record.cow_tag).catch(() => null);
+
+  if (!cow_id && !record.cow_tag)
+    return res.status(400).json({ error: 'Choose a cow, or write the ID/Tag no. from the form.' });
+
+  try {
+    const { rows } = await pool.query(
+      insertSql(['cow_id', 'source_filename']),
+      insertValues(record, [cow_id, null])
+    );
+    res.status(201).json({ success: true, record: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* PUT /:id  — edit a record, whichever way it first arrived.
+
+   A parsed upload is a best reading of someone's handwriting, so the vet
+   has to be able to correct it; this is the same write as POST against an
+   existing row. source_filename is left alone — where the record came from
+   does not change because a field was fixed. */
+router.put('/:id', async (req, res) => {
+  const record = normaliseRecord(req.body);
+  const cow_id = await resolveCowId(req.body.cow_id, record.cow_tag).catch(() => null);
+
+  if (!cow_id && !record.cow_tag)
+    return res.status(400).json({ error: 'Choose a cow, or write the ID/Tag no. from the form.' });
+
+  const cols   = [...COLUMNS, 'cow_id'];
+  const setSql = cols.map((c, i) => `${c} = $${i + 1}`).join(', ');
+  const values = [...insertValues(record, [cow_id]), req.params.id];
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE cow_health_records
+          SET ${setSql}, updated_at = NOW()
+        WHERE id = $${values.length}
+        RETURNING id, cow_id, cow_tag, exam_date, final_diagnosis, uploaded_at`,
+      values
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true, record: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* POST /import  — upload a filled .docx of the same form */
 router.post('/import', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   const ext = req.file.originalname.split('.').pop().toLowerCase();
@@ -56,78 +164,21 @@ router.post('/import', upload.single('file'), async (req, res) => {
     return res.status(400).json({ error: 'Only .docx / .doc files are supported' });
 
   try {
-    // 1. Extract text from docx
-    const result = await mammoth.extractRawText({ buffer: req.file.buffer });
-    const rawText = result.value;
+    // 1. Read the form's fields out of the document, then put them through
+    //    the same normalisation the in-app form uses, so a parsed record and
+    //    a typed one are stored identically.
+    const { fields, warnings } = await parseHealthDocx(req.file.buffer);
+    const parsed = normaliseRecord(fields);
 
-    // 2. Parse fields from text
-    const parsed = parseHealthDoc(rawText);
+    // 2. Resolve the cow — an explicit choice in the upload dialog, else
+    //    the tag written on the sheet.
+    const cow_id = await resolveCowId(req.body.cow_id, parsed.cow_tag);
 
-    // 3. Resolve cow_id — match by tag or name if provided in body or parsed
-    let cow_id = req.body.cow_id ? parseInt(req.body.cow_id) : null;
-    if (!cow_id && parsed.cow_tag) {
-      const match = await pool.query(
-        `SELECT id FROM cows WHERE tag = $1 OR UPPER(name) = UPPER($1) LIMIT 1`,
-        [parsed.cow_tag]
-      );
-      if (match.rows.length) cow_id = match.rows[0].id;
-    }
-
-    // 4. Save to DB
-    const { rows } = await pool.query(`
-      INSERT INTO cow_health_records (
-        cow_id, cow_tag, age, breed, parity, daily_milk_yield, days_in_milk,
-        body_weight, body_temperature, pulse_rate, respiratory_rate,
-        crt_seconds, rumino_motility, present_illness, past_history,
-        environment, system_review, clinical_findings, tentative_diagnosis,
-        blood_smear, buffy_coat, pcv, eosinophils, basophils, neutrophils,
-        bacteriology, skin_scrapings, fecal_sample, other_lab, lab_findings,
-        final_diagnosis, treatments, milk_withdraw_date, attending_vet,
-        license_number, exam_date, source_filename
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-        $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,
-        $33,$34,$35,$36,$37
-      ) RETURNING id, cow_id, cow_tag, exam_date, final_diagnosis, uploaded_at
-    `, [
-      cow_id,
-      parsed.cow_tag,
-      parsed.age,
-      parsed.breed,
-      parsed.parity,
-      parsed.daily_milk_yield,
-      parsed.days_in_milk,
-      parsed.body_weight,
-      parsed.body_temperature,
-      parsed.pulse_rate,
-      parsed.respiratory_rate,
-      parsed.crt_seconds,
-      parsed.rumino_motility,
-      parsed.present_illness,
-      parsed.past_history,
-      parsed.environment,
-      parsed.system_review,
-      JSON.stringify(parsed.clinical_findings),
-      parsed.tentative_diagnosis,
-      parsed.blood_smear,
-      parsed.buffy_coat,
-      parsed.pcv,
-      parsed.eosinophils,
-      parsed.basophils,
-      parsed.neutrophils,
-      parsed.bacteriology,
-      parsed.skin_scrapings,
-      parsed.fecal_sample,
-      parsed.other_lab,
-      parsed.lab_findings,
-      parsed.final_diagnosis,
-      JSON.stringify(parsed.treatments),
-      parsed.milk_withdraw_date,
-      parsed.attending_vet,
-      parsed.license_number,
-      parsed.exam_date,
-      req.file.originalname,
-    ]);
+    // 3. Save
+    const { rows } = await pool.query(
+      insertSql(['cow_id', 'source_filename']),
+      insertValues(parsed, [cow_id, req.file.originalname])
+    );
 
     res.status(201).json({
       success: true,
@@ -137,7 +188,7 @@ router.post('/import', upload.single('file'), async (req, res) => {
           v !== null && (Array.isArray(v) ? v.length > 0 : true)
         )
       ),
-      warnings: result.messages,
+      warnings,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

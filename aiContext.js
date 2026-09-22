@@ -12,12 +12,45 @@
      • Never return raw rows for an unbounded table.
 ══════════════════════════════════════════════════════════════ */
 const { pool } = require('./db');
+const { balance } = require('./lib/inventoryLedger');
 const { applyIssued, issuedForUpload } = require('./lib/processingReconcile');
 const { litresFor } = require('./processingCatalog');
+const { COLUMNS: HEALTH_RECORD_COLUMNS } = require('./lib/healthRecordForm');
 
 /* ── helpers ─────────────────────────────────────────────── */
 
 const num = (v) => (v === null || v === undefined ? null : Number(v));
+
+/**
+ * A row with its blanks dropped.
+ *
+ * The context is handed to the model as pretty-printed JSON, so a field
+ * nobody filled in costs the same prompt space as one that carries a
+ * finding — and an examination sheet is mostly blanks by design. Dropping
+ * them is what lets a health record be sent whole without the payload
+ * growing to match: what is left is what the vet actually recorded.
+ */
+const isBlank = (v) =>
+  v === null || v === undefined || v === '' ||
+  (Array.isArray(v) && v.length === 0);
+
+const compact = (row) => Object.fromEntries(
+  Object.entries(row)
+    .filter(([, v]) => !isBlank(v))
+    /* Findings and prescriptions are rows inside the record, and a
+       "Normal" system with nothing written beside it carries a blank
+       observation of its own. Pruning stops at that depth — one level of
+       rows is as deep as anything in this file nests. */
+    .map(([k, v]) => [
+      k,
+      Array.isArray(v)
+        ? v.map(item =>
+            item && typeof item === 'object' && !Array.isArray(item)
+              ? Object.fromEntries(Object.entries(item).filter(([, x]) => !isBlank(x)))
+              : item)
+        : v,
+    ])
+);
 /* Same, but for arithmetic: a missing figure is zero, never NaN. */
 const num0 = (v) => {
   const n = Number(v);
@@ -185,10 +218,17 @@ async function healthContext({ from, to }) {
 
     // cow_health_records stores exam_date as free text, so filter on the
     // upload timestamp instead — it is the only reliable ordering we have.
+    //
+    // What each examination concluded, not how it got there: across sixty
+    // animals the complaint, the findings, the diagnosis and what the vet
+    // advised are what a herd report reasons about. The vitals and the lab
+    // panel belong to one animal's history, and cowContext sends those in
+    // full.
     pool.query(`
-      SELECT r.cow_tag, r.breed, r.exam_date,
+      SELECT r.cow_tag, r.breed, r.sex, r.repro_status, r.exam_date,
+             r.present_illness, r.significant_findings,
              r.tentative_diagnosis, r.final_diagnosis,
-             r.attending_vet, r.milk_withdraw_date,
+             r.recommendation, r.attending_vet, r.milk_withdraw_date,
              c.name AS cow_name
       FROM cow_health_records r
       LEFT JOIN cows c ON c.id = r.cow_id
@@ -210,7 +250,7 @@ async function healthContext({ from, to }) {
   return {
     diseases:   diseases.rows,
     treatments: treatments.rows,
-    vet_records: records.rows,
+    vet_records: records.rows.map(compact),
     cow_events: history.rows,
   };
 }
@@ -410,24 +450,34 @@ async function customersContext({ from, to }) {
 async function inventoryContext({ from, to }) {
   const [stock, movements] = await Promise.all([
     pool.query(`
-      SELECT i.name, i.unit, i.notes,
-             ROUND(COALESCE(SUM(
-               CASE WHEN l.type = 'in' THEN l.quantity ELSE -l.quantity END
-             ), 0)::numeric, 2) AS current_stock
+      SELECT i.name, i.unit, i.pack_unit, i.pack_size, i.category, i.notes, i.supplier,
+             i.reorder_level, i.unit_cost,
+             ROUND(${balance('l')}::numeric, 2) AS current_stock
       FROM inventory_items i
       LEFT JOIN inventory_logs l ON l.item_id = i.id
-      GROUP BY i.id, i.name, i.unit, i.notes
+      WHERE i.status = 'active'
+      GROUP BY i.id
       ORDER BY current_stock ASC
     `),
 
+    /* Damage is its own column, not folded into "used".
+       "We got through 4,000 bottles" and "we got through 3,600 and broke
+       400" are different facts about the same month, and the second is the
+       one worth asking a question about. */
     pool.query(`
-      SELECT i.name, i.unit,
-             ROUND(SUM(CASE WHEN l.type = 'in'  THEN l.quantity ELSE 0 END)::numeric, 2) AS received,
-             ROUND(SUM(CASE WHEN l.type = 'out' THEN l.quantity ELSE 0 END)::numeric, 2) AS used
+      SELECT i.name, i.unit, i.category,
+             ROUND(SUM(CASE WHEN l.type = 'in'     THEN l.quantity ELSE 0 END)::numeric, 2) AS received,
+             ROUND(SUM(CASE WHEN l.type = 'out'    THEN l.quantity ELSE 0 END)::numeric, 2) AS used,
+             ROUND(SUM(CASE WHEN l.type IN ('out','damage')
+                            THEN COALESCE(l.cost, l.quantity * COALESCE(l.unit_cost, i.unit_cost))
+                            ELSE 0 END)::numeric, 2) AS consumed_cost,
+             ROUND(SUM(CASE WHEN l.type = 'damage' THEN l.quantity ELSE 0 END)::numeric, 2) AS damaged,
+             ROUND(SUM(CASE WHEN l.type = 'return' THEN l.quantity ELSE 0 END)::numeric, 2) AS returned,
+             ROUND(SUM(CASE WHEN l.type = 'adjust' THEN l.quantity ELSE 0 END)::numeric, 2) AS count_adjustments
       FROM inventory_logs l
       JOIN inventory_items i ON i.id = l.item_id
       WHERE l.date BETWEEN $1 AND $2
-      GROUP BY i.id, i.name, i.unit
+      GROUP BY i.id, i.name, i.unit, i.category
       ORDER BY used DESC
     `, [from, to]),
   ]);
@@ -435,16 +485,69 @@ async function inventoryContext({ from, to }) {
   const items = stock.rows.map(r => ({
     name: r.name,
     unit: r.unit,
+    category: r.category,
     current_stock: num(r.current_stock),
+    reorder_level: num(r.reorder_level),
+    /* Both readings of the same shelf: 480 ml, which is 4.8 bottles. */
+    ...(num(r.pack_size) > 1 ? {
+      pack_unit: r.pack_unit,
+      pack_size: num(r.pack_size),
+      current_packs: Math.round((num(r.current_stock) / num(r.pack_size)) * 1000) / 1000,
+      cost_per_pack: Math.round(num(r.pack_size) * num(r.unit_cost) * 100) / 100,
+    } : {}),
+    cost_per_unit: num(r.unit_cost),
+    stock_value: Math.round(num(r.current_stock) * num(r.unit_cost) * 100) / 100,
+    supplier: r.supplier,
     notes: r.notes,
   }));
 
+  const periodRows = movements.rows.map(r => {
+    const used = num(r.used), damaged = num(r.damaged);
+    return {
+      name: r.name, unit: r.unit, category: r.category,
+      received: num(r.received), used, damaged,
+      returned: num(r.returned),
+      count_adjustments: num(r.count_adjustments),
+      /* What the stock that left the shelf was worth, costed at the rate
+         standing when each movement happened. This is the figure behind
+         "what did we spend on medicines" — the store's spending on what
+         it USED, as against what it spent restocking. */
+      consumed_cost: num(r.consumed_cost),
+      damage_rate_pct: used + damaged > 0
+        ? Math.round((damaged / (used + damaged)) * 1000) / 10
+        : 0,
+    };
+  });
+
+  /* Grouped so a question about one shelf does not need the model to add
+     up forty rows and hope. Medicines are the shelf most often asked
+     about by cost rather than by quantity. */
+  const costByCategory = {};
+  for (const r of periodRows) {
+    costByCategory[r.category] = Math.round(
+      ((costByCategory[r.category] || 0) + r.consumed_cost) * 100
+    ) / 100;
+  }
+
   return {
     items,
+    stock_value: Math.round(items.reduce((t, i) => t + i.stock_value, 0) * 100) / 100,
+    consumed_cost_in_period: Math.round(
+      periodRows.reduce((t, r) => t + r.consumed_cost, 0) * 100
+    ) / 100,
+    consumed_cost_by_category: costByCategory,
     out_of_stock: items.filter(i => i.current_stock <= 0).map(i => i.name),
-    movements_in_period: movements.rows.map(r => ({
-      name: r.name, unit: r.unit, received: num(r.received), used: num(r.used),
-    })),
+    /* Below the level the store itself set for reordering — the list
+       somebody has to act on, as opposed to the list of things that have
+       already run out and stopped the line. */
+    needs_ordering: items
+      .filter(i => i.current_stock > 0 && i.reorder_level > 0 && i.current_stock <= i.reorder_level)
+      .map(i => ({ name: i.name, on_hand: i.current_stock, reorder_level: i.reorder_level, unit: i.unit })),
+    movements_in_period: periodRows,
+    damaged_in_period: periodRows
+      .filter(r => r.damaged > 0)
+      .sort((a, b) => b.damaged - a.damaged)
+      .map(r => ({ name: r.name, unit: r.unit, damaged: r.damaged, damage_rate_pct: r.damage_rate_pct })),
   };
 }
 
@@ -783,11 +886,14 @@ async function cowDossier(cowId) {
         FROM cow_history WHERE cow_id = $1 ORDER BY date DESC LIMIT 50
       `, [cowId]),
 
+      /* The examination sheet in full, for this one animal.
+         The column list comes from the form's own catalogue rather than
+         being written out here, because a hand-kept list is what left this
+         query short of the vet's major complaint, significant findings and
+         recommendation after those were added to the form. Ten records of
+         it stay small because compact() drops what the vet left blank. */
       pool.query(`
-        SELECT exam_date, age, parity, body_weight, body_temperature, pulse_rate,
-               respiratory_rate, days_in_milk, daily_milk_yield, present_illness,
-               clinical_findings, tentative_diagnosis, final_diagnosis,
-               lab_findings, treatments, milk_withdraw_date, attending_vet
+        SELECT ${HEALTH_RECORD_COLUMNS.join(', ')}
         FROM cow_health_records WHERE cow_id = $1
         ORDER BY uploaded_at DESC LIMIT 10
       `, [cowId]),
@@ -825,7 +931,7 @@ async function cowDossier(cowId) {
     treatments: treatments.rows,
     pregnancies: pregnancies.rows,
     events: history.rows,
-    vet_records: vet.rows,
+    vet_records: vet.rows.map(compact),
   };
 }
 
@@ -862,17 +968,18 @@ async function alertSignals() {
       ORDER BY p.expected_due_date
     `),
 
+    /* Out, or down to the level the store reorders at — the second is the
+       one a briefing can still do something about. */
     pool.query(`
-      SELECT i.name, i.unit,
-             ROUND(COALESCE(SUM(
-               CASE WHEN l.type = 'in' THEN l.quantity ELSE -l.quantity END
-             ), 0)::numeric, 2) AS current_stock
+      SELECT i.name, i.unit, i.reorder_level,
+             ROUND(${balance('l')}::numeric, 2) AS current_stock
       FROM inventory_items i
       LEFT JOIN inventory_logs l ON l.item_id = i.id
-      GROUP BY i.id, i.name, i.unit
-      HAVING COALESCE(SUM(
-        CASE WHEN l.type = 'in' THEN l.quantity ELSE -l.quantity END
-      ), 0) <= 0
+      WHERE i.status = 'active'
+      GROUP BY i.id, i.name, i.unit, i.reorder_level
+      HAVING ${balance('l')} <= 0
+          OR (i.reorder_level > 0 AND ${balance('l')} <= i.reorder_level)
+      ORDER BY ${balance('l')} ASC
     `),
 
     // Cows with no milk record in the last 3 days despite having history —
@@ -967,11 +1074,90 @@ async function alertSignals() {
       drop_pct: num(r.drop_pct),
     })),
     births_window: dueSoon.rows,
-    out_of_stock: lowStock.rows.map(r => ({
-      name: r.name, unit: r.unit, current_stock: num(r.current_stock),
+    /* Named for what it now holds. The query used to return only items
+       already at zero; it returns those at or below their reorder level
+       too, and calling that "out_of_stock" would have the briefing report
+       a store as empty when it is merely due an order. `state` says which
+       of the two each row is. */
+    stock_needing_attention: lowStock.rows.map(r => ({
+      name: r.name, unit: r.unit,
+      current_stock: num(r.current_stock),
+      reorder_level: num(r.reorder_level),
+      state: num(r.current_stock) <= 0 ? 'out of stock' : 'at or below reorder level',
     })),
     cows_missing_records: staleCows.rows,
     recent_diseases: recentDisease.rows,
+  };
+}
+
+/* ── what it cost ──────────────────────────────────────────
+   The other half of a period. Revenue without the spending beside it
+   reads as a good month whatever was paid out to produce it, and the
+   farm's own book has always kept the two apart — one workbook for the
+   milk, another for the money going out.
+
+   Categories are the farm's own lines, so "Home affairs" really is the
+   household and is not farm cost; the note says so rather than leaving
+   the model to net it off against milk revenue on its own. */
+
+async function expensesContext({ from, to, prevFrom, prevTo }) {
+  const totalSql = `
+    SELECT COUNT(*)::int                              AS entries,
+           ROUND(COALESCE(SUM(amount), 0)::numeric, 2) AS total
+    FROM expenses WHERE entry_date BETWEEN $1 AND $2
+  `;
+
+  const [totals, prev, byCategory, biggest, monthly] = await Promise.all([
+    pool.query(totalSql, [from, to]),
+    pool.query(totalSql, [prevFrom, prevTo]),
+    pool.query(`
+      SELECT c.name AS category,
+             ROUND(COALESCE(SUM(e.amount), 0)::numeric, 2) AS total,
+             COUNT(e.id)::int                              AS entries,
+             ROUND(COALESCE((
+               SELECT SUM(p.amount) FROM expenses p
+               WHERE p.category_id = c.id AND p.entry_date BETWEEN $3 AND $4
+             ), 0)::numeric, 2)                            AS previous_period
+      FROM expense_categories c
+      JOIN expenses e ON e.category_id = c.id AND e.entry_date BETWEEN $1 AND $2
+      GROUP BY c.id, c.name ORDER BY total DESC
+    `, [from, to, prevFrom, prevTo]),
+    /* The handful of lines that moved the total. A month of fuel at
+       40,000 a time is not what makes one month differ from the last —
+       the lorry repair and the tractor build are. */
+    pool.query(`
+      SELECT TO_CHAR(e.entry_date,'YYYY-MM-DD') AS date, c.name AS category,
+             e.details, ROUND(e.amount::numeric, 2) AS amount
+      FROM expenses e JOIN expense_categories c ON c.id = e.category_id
+      WHERE e.entry_date BETWEEN $1 AND $2
+      ORDER BY e.amount DESC LIMIT 12
+    `, [from, to]),
+    /* A year of month totals, so a trend can be read without a second
+       call. Cheap: one row per month. */
+    pool.query(`
+      SELECT TO_CHAR(DATE_TRUNC('month', entry_date), 'YYYY-MM') AS month,
+             ROUND(SUM(amount)::numeric, 2) AS total
+      FROM expenses
+      WHERE entry_date >= (DATE_TRUNC('month', $1::date) - INTERVAL '11 months')
+        AND entry_date <= $1
+      GROUP BY 1 ORDER BY 1
+    `, [to]),
+  ]);
+
+  return {
+    note: 'What the farm paid out, from the monthly expenses book. Every figure is the sum '
+        + 'of the lines beneath it. "Home affairs" is the household rather than farm cost, '
+        + 'and "BMH" is the milk-buying and shop side, so neither belongs in a cost-per-litre '
+        + 'for the herd. A month with nothing against it usually means its workbook has not '
+        + 'been uploaded yet, not that nothing was spent.',
+    totals: { entries: totals.rows[0].entries, total: num(totals.rows[0].total) },
+    previous_period: { entries: prev.rows[0].entries, total: num(prev.rows[0].total) },
+    by_category: byCategory.rows.map(r => ({
+      category: r.category, total: num(r.total), entries: r.entries,
+      previous_period: num(r.previous_period),
+    })),
+    largest_lines: biggest.rows.map(r => ({ ...r, amount: num(r.amount) })),
+    monthly_trend: monthly.rows.map(r => ({ month: r.month, total: num(r.total) })),
   };
 }
 
@@ -980,18 +1166,19 @@ async function alertSignals() {
 async function farmSnapshot({ from, to } = {}) {
   const period = resolvePeriod(from, to);
 
-  const [production, health, pregnancies, sales, debtors, inventory, processing] =
+  const [production, health, pregnancies, sales, debtors, expenses, inventory, processing] =
     await Promise.all([
       productionContext(period),
       healthContext(period),
       pregnancyContext(period),
       salesContext(period),
       customersContext(period),
+      expensesContext(period),
       inventoryContext(period),
       processingContext(),
     ]);
 
-  return { period, production, health, pregnancies, sales, debtors, inventory, processing };
+  return { period, production, health, pregnancies, sales, debtors, expenses, inventory, processing };
 }
 
 module.exports = {
@@ -1003,6 +1190,7 @@ module.exports = {
   pregnancyContext,
   salesContext,
   customersContext,
+  expensesContext,
   inventoryContext,
   processingContext,
   processingMonth,

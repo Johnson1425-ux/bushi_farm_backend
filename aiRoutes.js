@@ -176,7 +176,8 @@ their figures. Flag thin sample sizes rather than reading trends into them.
 ## Herd health
 Diseases recorded, treatments given, and veterinary findings. Connect health
 events to production changes where the dates line up — and say plainly when they
-do not line up rather than implying a link.
+do not line up rather than implying a link. Where examinations in the period
+carry recommendations, gather the ones still outstanding.
 
 ## Breeding
 Births in the period, new conceptions, and pregnancies due soon. Include the
@@ -186,6 +187,16 @@ cow names and dates.
 Volume sold, revenue, average price, and how those moved against the previous
 period. Note any gap between litres produced and litres sold. Call out items
 that are out of stock or being consumed quickly.
+
+## What it cost
+Total spending in the period and how it moved against the previous one, with
+the categories that account for the change and the individual lines big enough
+to have caused it. Keep the household ("Home affairs") apart from farm cost
+rather than folding the two together, and say which side of the business a
+category belongs to when it matters. Set the spending against revenue only when
+both are present for the same period. A category at zero more often means its
+workbook has not been uploaded than that nothing was spent — say that rather
+than reporting a saving. Skip this section entirely if nothing was recorded.
 
 ## Processing unit
 Milk received, packed, issued, damaged, and closing stock, using the
@@ -459,8 +470,11 @@ deviation — a high spread means erratic yield, which is itself worth flagging.
 ## Health record
 Diseases, treatments, and veterinary examination findings in date order. Include
 clinical values (temperature, pulse, body weight, PCV) where they were recorded
-and say whether they sit inside normal bovine ranges. Note any milk withdrawal
-dates that are still in effect.
+and say whether they sit inside normal bovine ranges. Where an examination
+recorded a major complaint, significant findings or a recommendation, carry the
+vet's own words rather than paraphrasing the diagnosis over them, and say
+whether their recommendation still stands. Note any milk withdrawal dates that
+are still in effect.
 
 ## Breeding record
 Conceptions, expected due dates, and births. If she is currently pregnant, give
@@ -554,7 +568,8 @@ const CHAT_TOOLS = [
     name: 'get_farm_data',
     description:
       'Farm data for a date range: production totals and per-cow figures, health events, '
-      + 'breeding, sales, inventory, and the processing unit. Call this for any question '
+      + 'breeding, sales, what was spent and on what, inventory, and the processing unit. '
+      + 'Call this for any question '
       + 'about what happened over a period, comparisons between periods, or farm-wide '
       + 'totals. Request only the sections you need — each one costs tokens.',
     input_schema: {
@@ -567,7 +582,7 @@ const CHAT_TOOLS = [
           description: 'Which sections to return. Omit for all of them.',
           items: {
             type: 'string',
-            enum: ['production', 'health', 'pregnancies', 'sales', 'inventory', 'processing'],
+            enum: ['production', 'health', 'pregnancies', 'sales', 'expenses', 'inventory', 'processing'],
           },
         },
       },
@@ -658,7 +673,7 @@ async function runChatTool(name, input) {
       const period = ctx.resolvePeriod(input?.from, input?.to);
       const want = Array.isArray(input?.sections) && input.sections.length
         ? new Set(input.sections)
-        : new Set(['production', 'health', 'pregnancies', 'sales', 'inventory', 'processing']);
+        : new Set(['production', 'health', 'pregnancies', 'sales', 'expenses', 'inventory', 'processing']);
 
       const out = { period };
       const jobs = [];
@@ -666,6 +681,7 @@ async function runChatTool(name, input) {
       if (want.has('health'))      jobs.push(ctx.healthContext(period).then(v => { out.health = v; }));
       if (want.has('pregnancies')) jobs.push(ctx.pregnancyContext(period).then(v => { out.pregnancies = v; }));
       if (want.has('sales'))       jobs.push(ctx.salesContext(period).then(v => { out.sales = v; }));
+      if (want.has('expenses'))    jobs.push(ctx.expensesContext(period).then(v => { out.expenses = v; }));
       if (want.has('inventory'))   jobs.push(ctx.inventoryContext(period).then(v => { out.inventory = v; }));
       if (want.has('processing'))  jobs.push(ctx.processingContext().then(v => { out.processing = v; }));
       await Promise.all(jobs);

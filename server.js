@@ -11,10 +11,13 @@ const {
 
 const aiRoutes         = require('./aiRoutes');
 const { initAiTables }  = require('./aiClient');
-const { initNewTables, initHealthRecordsTables } = require('./lib/initTables');
+const { initNewTables, initHealthRecordsTables, initCalvesTable } = require('./lib/initTables');
 const { initStockTables } = require('./lib/initStock');
 const { initPosTables }   = require('./lib/initPos');
 const { initCustomerTables } = require('./lib/initCustomers');
+const { initExpenseTables }  = require('./lib/initExpenses');
+const { initRefreshTokenTables, purgeExpiredTokens } = require('./lib/refreshTokens');
+const { ALLOWED_ORIGINS } = require('./lib/origins');
 
 /* Route modules — one file per resource, each a plain express.Router().
    Role gates are applied once, here, at the mount point (see the "ROLE
@@ -29,6 +32,7 @@ const diseasesRoutes    = require('./routes/diseases');
 const treatmentsRoutes  = require('./routes/treatments');
 const cowHistoryRoutes  = require('./routes/cowHistory');
 const pregnanciesRoutes = require('./routes/pregnancies');
+const calvesRoutes      = require('./routes/calves');
 const alertsRoutes      = require('./routes/alerts');
 const salesRoutes       = require('./routes/sales');
 const inventoryRoutes   = require('./routes/inventory');
@@ -40,6 +44,7 @@ const stockRoutes       = require('./routes/stock');
 const issuesRoutes      = require('./routes/issues');
 const posRoutes         = require('./routes/pos');
 const reportsRoutes     = require('./routes/reports');
+const expensesRoutes    = require('./routes/expenses');
 const { router: customersRoutes } = require('./routes/customers');
 
 const app = express();
@@ -47,11 +52,20 @@ const app = express();
 /* ── CORS ─────────────────────────────────────────────────
    One policy, applied to both real requests and preflights. A bare cors()
    call anywhere else would set Access-Control-Allow-Origin: * and silently
-   override the allowlist below, so there must not be one. */
+   override the allowlist below, so there must not be one.
+
+   `credentials` is what lets the refresh cookie travel at all, and it is
+   also why the allowlist can never become a wildcard: a browser refuses
+   to send credentials to an API that answers '*'.
+
+   X-Requested-With is on the list because the cookie-authenticated
+   endpoints require it (lib/origins.js). It is not a CORS-safelisted
+   header, so asking for it forces a preflight — which is precisely the
+   property being relied on there. */
 const corsOptions = {
-  origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://bushi-farm.vercel.app'],
+  origin: ALLOWED_ORIGINS,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true,
 };
 
@@ -61,7 +75,14 @@ app.use(express.json());
 
 /* Start the schema work now, so a warm process has it done already. */
 const initAllTables = () => Promise.all([
-  initAiTables(), initNewTables(), initHealthRecordsTables(),
+  initAiTables(), initHealthRecordsTables(), initExpenseTables(),
+  /* calves references pregnancies, which initNewTables creates. */
+  initNewTables().then(initCalvesTable),
+  /* Sessions live here. Spent and long-expired rows are swept on the way
+     in — there is no scheduler on a serverless host, and a cold start is
+     the one moment where a housekeeping query costs nothing anybody is
+     waiting on. A failure to sweep must not fail the boot. */
+  initRefreshTokenTables().then(() => purgeExpiredTokens().catch(() => {})),
   /* POS tables reference branches and products, so the stock schema has to
      be in place before they are created. */
   /* Each step depends on the tables the one before it creates: POS
@@ -140,6 +161,11 @@ app.use('/api/pos',      verifyToken, requireBranchAccess, posRoutes);
    balance is gated inside the router. */
 app.use('/api/customers', verifyToken, requireBranchAccess, customersRoutes);
 
+/* What the farm spends. Management's book, read by the same two roles as
+   the sales reports: an attendant runs one counter and has no business in
+   the household's line or the payroll. */
+app.use('/api/expenses', verifyToken, requireProduction, expensesRoutes);
+
 /* Reports span every branch and are management's view of the business, so
    they stay in manager territory rather than following the branch gate
    above — an attendant reads their own day through /api/pos. */
@@ -167,6 +193,9 @@ app.use('/api/users', verifyToken, requireAdmin, usersRoutes);
    cow-history endpoints nested under it belong to the vet side.
 ══════════════════════════════════ */
 app.use('/api/cows',      verifyToken, cowsRoutes);
+/* Same arrangement for the young stock: the vet and the manager both read
+   it, and routes/calves.js guards each write on its own. */
+app.use('/api/calves',    verifyToken, calvesRoutes);
 app.use('/api/analytics', verifyToken, analyticsRoutes);
 app.use('/api/alerts',    verifyToken, alertsRoutes);
 
