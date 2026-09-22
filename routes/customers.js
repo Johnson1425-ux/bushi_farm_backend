@@ -266,27 +266,6 @@ router.post('/:id/payments', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/* ── charge something that did not go through the till ───────
-   The paper book's DELIVERY column: goods handed over on account without
-   a receipt being rung up. */
-router.post('/:id/charges', requireProduction, async (req, res) => {
-  const amount = money(req.body.amount);
-  if (!(amount > 0)) return res.status(400).json({ error: 'A charge must be more than zero' });
-  const description = String(req.body.description || '').trim();
-  if (!description) return res.status(400).json({ error: 'A charge needs a description' });
-
-  const date = req.body.date || new Date().toISOString().slice(0, 10);
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO customer_entries
-         (customer_id, entry_date, kind, amount, branch_id, ref_kind, description, created_by)
-       VALUES ($1,$2,'charge',$3,$4,'manual',$5,$6) RETURNING *`,
-      [req.params.id, date, amount, req.body.branch_id || null, description, req.user.id]
-    );
-    res.status(201).json(rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 /* Write off, or correct a balance. Signed, and a reason is required —
    an adjustment nobody explained is indistinguishable from a mistake. */
 router.post('/:id/adjustments', requireProduction, async (req, res) => {

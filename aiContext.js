@@ -13,7 +13,7 @@
 ══════════════════════════════════════════════════════════════ */
 const { pool } = require('./db');
 const { balance } = require('./lib/inventoryLedger');
-const { applyIssued, ledgerIssuedDaily } = require('./lib/processingReconcile');
+const { applyIssued, issuedForUpload } = require('./lib/processingReconcile');
 const { litresFor } = require('./processingCatalog');
 const { COLUMNS: HEALTH_RECORD_COLUMNS } = require('./lib/healthRecordForm');
 
@@ -585,7 +585,7 @@ async function processingContext(limit = 2) {
      everything downstream treats it as just another block of month figures. */
   const issuedAcrossUploads = async (uploadRows) => {
     const perUpload = await Promise.all(
-      uploadRows.map(u => ledgerIssuedDaily(pool, u).then(daily => ({ id: u.id, daily })))
+      uploadRows.map(u => issuedForUpload(pool, u).then(r => ({ id: u.id, daily: r.issued })))
     );
     const rows = [];
     for (const { id, daily } of perUpload) {
@@ -708,9 +708,11 @@ async function processingContext(limit = 2) {
   });
 
   return {
-    note: 'Packs issued come from the in-app issue notes that send stock to a branch, not '
-        + 'from the workbook — the workbook\'s own issued column is no longer read. Closing '
-        + 'stock is opening + packed - issued - damaged, worked out on read. '
+    note: 'Packs issued come from the in-app issue notes that send stock to a named branch. '
+        + 'For months before those notes existed the workbook\'s own issued column is used '
+        + 'instead, so older months read correctly rather than as nothing issued. The two are '
+        + 'never added together. Closing stock is opening + packed - issued - damaged, worked '
+        + 'out on read. '
         + 'Processing records are organised by month, not by calendar date, so they may '
         + 'not align exactly with the report period. Litres for packed, issued and damaged '
         + 'goods are derived from the pack size, not typed in.',
@@ -757,7 +759,7 @@ async function processingMonth(label) {
       FROM processing_milk_received WHERE upload_id = $1 ORDER BY day
     `, [up.id]),
     daily('processing_packed'),
-    ledgerIssuedDaily(pool, up).then(r => ({ rows: r })),
+    issuedForUpload(pool, up).then(r => ({ rows: r.issued })),
     daily('processing_damaged'),
     pool.query(`
       SELECT product, size, opening_units, packed_units,
@@ -1034,7 +1036,7 @@ async function alertSignals() {
       'SELECT product, size, units, litres FROM processing_stock WHERE upload_id = $1',
       [procRows[0].id]
     );
-    const issued = await ledgerIssuedDaily(pool, procRows[0]);
+    const { issued } = await issuedForUpload(pool, procRows[0]);
     return applyIssued(stockRows, issued, { litresFor })
       .filter(r => num0(r.units) < 0)
       .map(r => ({ product: r.product, size: r.size, closing_units: num0(r.units) }));
