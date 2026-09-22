@@ -708,11 +708,13 @@ async function processingContext(limit = 2) {
   });
 
   return {
-    note: 'Packs issued come from the in-app issue notes that send stock to a named branch. '
-        + 'For months before those notes existed the workbook\'s own issued column is used '
-        + 'instead, so older months read correctly rather than as nothing issued. The two are '
-        + 'never added together. Closing stock is opening + packed - issued - damaged, worked '
-        + 'out on read. '
+    note: 'Packs issued come from the uploaded workbook\'s own issued column while that '
+        + 'column is still being filled in. A month uploaded with it left empty takes its '
+        + 'issued figures from the in-app issue notes that send stock to a named branch '
+        + 'instead. The two are never added together, and a month may have both: stock has '
+        + 'to reach a branch before a till can sell it, so issue notes exist well before the '
+        + 'farm stops recording issuing on the sheet. Closing stock is opening + packed - '
+        + 'issued - damaged, worked out on read. '
         + 'Processing records are organised by month, not by calendar date, so they may '
         + 'not align exactly with the report period. Litres for packed, issued and damaged '
         + 'goods are derived from the pack size, not typed in.',
