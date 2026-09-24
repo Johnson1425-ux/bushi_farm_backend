@@ -1,5 +1,6 @@
 const express = require('express');
 const { pool } = require('../db');
+const { balance, stockState } = require('../lib/inventoryLedger');
 
 const router = express.Router();
 
@@ -8,6 +9,46 @@ const router = express.Router();
 // by useAlerts.js on the frontend) and GET /daily (a slightly different
 // production-drop/low-stock variant). Left as-is rather than merged, so
 // behavior does not shift as part of this refactor.
+
+/**
+ * Store lines that are out, or down to the level the store reorders at.
+ *
+ * Written once and used by both handlers below. It had lived only in
+ * /daily — which nothing on the frontend calls — so the one alert the
+ * store keeper could actually act on was the one nobody ever saw. It is
+ * on GET / as well now, which is what useAlerts.js polls.
+ *
+ * An item with no reorder level set can only be "out": a level of zero
+ * means nobody has said what low looks like for that line, and warning on
+ * every row from the day it was added is how an alert list gets ignored.
+ */
+async function storeStockAlerts() {
+  const { rows } = await pool.query(`
+    SELECT i.name, i.unit, i.reorder_level,
+           ${balance('l')} AS current_stock
+    FROM inventory_items i
+    LEFT JOIN inventory_logs l ON l.item_id = i.id
+    WHERE i.status = 'active'
+    GROUP BY i.id, i.name, i.unit, i.reorder_level
+    HAVING ${balance('l')} <= 0
+        OR (i.reorder_level > 0 AND ${balance('l')} <= i.reorder_level)
+    ORDER BY ${balance('l')} ASC
+  `);
+
+  return rows.map((r) => {
+    const qty   = Number(r.current_stock) || 0;
+    const level = Number(r.reorder_level) || 0;
+    const state = stockState(qty, level);
+    return {
+      type: 'low_stock',
+      severity: state === 'out' ? 'high' : 'medium',
+      message: state === 'out'
+        ? `${r.name} is out of stock`
+        : `${r.name} is down to ${qty} ${r.unit} — at or below its reorder level of ${level}`,
+      item: r.name,
+    };
+  });
+}
 
 router.get('/', async (req, res) => {
   try {
@@ -76,6 +117,9 @@ router.get('/', async (req, res) => {
       });
     }
 
+    // 4. Store stock that is out, or due an order.
+    alerts.push(...await storeStockAlerts());
+
     res.json(alerts);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -134,23 +178,8 @@ router.get('/daily', async (req, res) => {
       });
     }
 
-    // 3. Low inventory — items with stock <= 0
-    const { rows: stockRows } = await pool.query(`
-      SELECT i.name,
-        COALESCE(SUM(CASE WHEN l.type='in' THEN l.quantity ELSE -l.quantity END),0) AS current_stock
-      FROM inventory_items i
-      LEFT JOIN inventory_logs l ON l.item_id = i.id
-      GROUP BY i.id, i.name
-      HAVING COALESCE(SUM(CASE WHEN l.type='in' THEN l.quantity ELSE -l.quantity END),0) <= 0
-    `);
-    for (const r of stockRows) {
-      alerts.push({
-        type: 'low_stock',
-        severity: 'medium',
-        message: `${r.name} is out of stock`,
-        item: r.name,
-      });
-    }
+    // 3. Store stock that is out, or due an order.
+    alerts.push(...await storeStockAlerts());
 
     res.json(alerts);
   } catch (err) { res.status(500).json({ error: err.message }); }

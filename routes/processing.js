@@ -103,6 +103,12 @@ router.get('/:id', async (req, res) => {
       issued:   reconciled.issued,
       damaged:  damaged.rows,
       stock:    reconciled.stock,
+      /* Where the issued figures came from, so the page can say so. An
+         issued total nobody can attribute is worse than none. */
+      issued_source:  reconciled.issued_source,
+      issued_ledger:  reconciled.ledger_units,
+      issued_workbook: reconciled.workbook_units,
+      issued_both:    reconciled.both_present,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -190,6 +196,10 @@ router.post('/upload', upload.single('file'), async (req, res) => {
         }
       };
       await insertDaily('processing_packed',  m.packed);
+      /* Kept for the months before anyone was raising issue notes. Which
+         figure a month actually uses is settled on read — see
+         lib/processingReconcile.js. */
+      await insertDaily('processing_issued',  m.issued);
       await insertDaily('processing_damaged', m.damaged);
 
       /* ── what the sheet accounts for, with the movements that produced it ──
@@ -220,6 +230,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
           received_litres: Math.round(total(m.received, 'litres') * 10) / 10,
           packed_units:    total(m.packed, 'units'),
           packed_litres:   Math.round(total(m.packed, 'litres') * 10) / 10,
+          issued_units:    total(m.issued, 'units'),
           damaged_units:   total(m.damaged, 'units'),
           available_units: total(m.stock, 'available'),
         },

@@ -21,15 +21,70 @@ if (!process.env.JWT_SECRET) {
 
 const SECRET = process.env.JWT_SECRET || DEV_FALLBACK_SECRET;
 
+/* ══════════════════════════════════
+   ACCESS TOKENS
+
+   Short-lived by design. The access token is the only credential the API
+   itself checks, and it carries no revocation list — so its lifetime IS
+   the window in which a sacked account, a changed role or a stolen token
+   still works. Fifteen minutes keeps that window small without asking
+   anyone to sign in again: the client trades its refresh token for a new
+   access token in the background (see lib/refreshTokens.js).
+
+   Long enough that a slow report or a long form is never interrupted
+   mid-request; short enough that nothing survives a sign-out for long.
+══════════════════════════════════ */
+const ACCESS_TTL_SECONDS = parseInt(process.env.ACCESS_TOKEN_SECONDS, 10) > 0
+  ? parseInt(process.env.ACCESS_TOKEN_SECONDS, 10)
+  : 15 * 60;
+
+/**
+ * Mint an access token for a user row.
+ *
+ * The claims are the authorization decision, made once here rather than
+ * looked up per request: `role` gates the route, `branch_id` pins an
+ * attendant to their till. `sid` names the session the token was minted
+ * for, so a token can be traced back to the sign-in that produced it.
+ */
+function signAccessToken(user, { sid } = {}) {
+  return jwt.sign(
+    {
+      id: user.id, username: user.username, role: user.role,
+      branch_id: user.branch_id ?? null,
+      typ: 'access',
+      ...(sid ? { sid } : {}),
+    },
+    SECRET,
+    { expiresIn: ACCESS_TTL_SECONDS }
+  );
+}
+
 function verifyToken(req, res, next) {
   const header = req.headers['authorization'];
   const token  = header && header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
-    req.user = jwt.verify(token, SECRET);
+    const claims = jwt.verify(token, SECRET);
+    /* Refresh tokens are opaque and never reach this path, so `typ` is a
+       belt-and-braces check rather than the boundary. Tokens minted before
+       access and refresh were split carry no `typ` at all; they are still
+       honoured so an open tab is not signed out by the deploy, and they
+       age out on their own within a week. */
+    if (claims.typ && claims.typ !== 'access') {
+      return res.status(401).json({ error: 'Wrong kind of token' });
+    }
+    req.user = claims;
     next();
-  } catch {
-    res.status(401).json({ error: 'Invalid or expired token' });
+  } catch (err) {
+    /* The client tells these two apart: an expired access token means
+       "refresh and retry", anything else means "sign in again". Without
+       the distinction every 401 looks fatal and the refresh is never
+       attempted. */
+    const expired = err?.name === 'TokenExpiredError';
+    res.status(401).json({
+      error: expired ? 'Access token expired' : 'Invalid token',
+      code:  expired ? 'token_expired' : 'token_invalid',
+    });
   }
 }
 
@@ -175,7 +230,7 @@ function clearLoginFailures(req) {
 }
 
 module.exports = {
-  verifyToken, SECRET, ROLES,
+  verifyToken, signAccessToken, ACCESS_TTL_SECONDS, SECRET, ROLES,
   requireRole, requireRoleForWrites,
   requireAdmin, requireProduction, requireHealth, requireBranchAccess,
   branchScope, assertBranchAllowed,
