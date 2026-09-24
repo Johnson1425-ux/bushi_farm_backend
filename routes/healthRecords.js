@@ -62,7 +62,17 @@ async function resolveCowId(explicitId, tag) {
  */
 function documentFilename(record) {
   const who  = record.cow_name || record.cow_tag || 'Unlinked';
-  const when = record.exam_date || String(record.uploaded_at || '').slice(0, 10);
+  /* The date the record is filed under, by the same rule the lists use: a
+     real date off the sheet, else the day it was saved. Naming a file
+     "Health Record - Daisy - last Tuesday" would take the point out of
+     dating it, which is that a folder of these sorts. */
+  const written = String(record.exam_date || '').trim();
+  /* uploaded_at comes back from pg as a Date, whose toString is
+     "Thu Sep 24 2026 ..." — the ISO form is the one that sorts. */
+  const saved = record.uploaded_at
+    ? new Date(record.uploaded_at).toISOString().slice(0, 10)
+    : '';
+  const when = /^\d{4}-\d{2}-\d{2}$/.test(written) ? written : saved;
   return [`Health Record`, who, when]
     .filter(Boolean)
     .join(' - ')
@@ -114,22 +124,93 @@ router.get('/:id/document', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/* GET /  — list all (optionally by cow) */
+/* ─── when an examination happened ────────────────────────────
+   exam_date is free text: it is whatever was written on the sheet, and an
+   upload can carry anything at all. So the date a record is filed under is
+   the one the vet wrote when that is a real date, and the day it reached
+   the app otherwise — never a cast that would throw on "last Tuesday". */
+const EFFECTIVE_DATE = `
+  CASE WHEN hr.exam_date ~ '^\\d{4}-\\d{2}-\\d{2}$'
+       THEN hr.exam_date::date
+       ELSE hr.uploaded_at::date
+  END`;
+
+/** A YYYY-MM-DD query parameter, or null. Anything else is ignored. */
+function asDate(v) {
+  const s = String(v || '').trim().slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+/* GET /by-cow — the animals that have health records.
+
+   The page opens on this rather than on every record in the herd: a
+   record belongs to a cow and cows accumulate them, so the list that
+   answers "whose records are these" is the one worth showing first.
+
+   Records are grouped by the cow they are linked to, and failing that by
+   the tag written on the sheet — an upload whose tag matched nothing in
+   the herd is still one animal's history, and burying those together
+   under "Unlinked" would lose that. */
+router.get('/by-cow', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      WITH labelled AS (
+        SELECT hr.*, c.name AS cow_name, c.tag AS herd_tag,
+               ${EFFECTIVE_DATE} AS effective_date,
+               COALESCE(hr.cow_id::text, 'tag:' || UPPER(hr.cow_tag), 'unlinked') AS group_key
+        FROM cow_health_records hr
+        LEFT JOIN cows c ON c.id = hr.cow_id
+      )
+      SELECT group_key,
+             MAX(cow_id)                               AS cow_id,
+             MAX(cow_name)                             AS cow_name,
+             COALESCE(MAX(herd_tag), MAX(cow_tag))     AS cow_tag,
+             COUNT(*)::int                             AS record_count,
+             MIN(effective_date)                       AS first_exam,
+             MAX(effective_date)                       AS last_exam,
+             MAX(uploaded_at)                          AS last_saved,
+             (ARRAY_AGG(final_diagnosis ORDER BY effective_date DESC, uploaded_at DESC)
+                FILTER (WHERE final_diagnosis IS NOT NULL))[1]  AS latest_diagnosis,
+             (ARRAY_AGG(attending_vet ORDER BY effective_date DESC, uploaded_at DESC)
+                FILTER (WHERE attending_vet IS NOT NULL))[1]    AS latest_vet
+      FROM labelled
+      GROUP BY group_key
+      ORDER BY MAX(effective_date) DESC, MAX(uploaded_at) DESC
+    `);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* GET /  — one cow's records, or all of them.
+
+   `cow_id` narrows to a linked animal and `cow_tag` to an unlinked one;
+   `from` and `to` narrow to a period, inclusive, against the date the
+   record is filed under. */
 router.get('/', async (req, res) => {
-  const { cow_id } = req.query;
+  const { cow_id, cow_tag } = req.query;
+  const from = asDate(req.query.from);
+  const to   = asDate(req.query.to);
+
   const params = [];
-  const where = cow_id ? (params.push(cow_id), 'WHERE hr.cow_id = $1') : '';
+  const clauses = [];
+  if (cow_id)  { params.push(cow_id);  clauses.push(`hr.cow_id = $${params.length}`); }
+  if (cow_tag) { params.push(cow_tag); clauses.push(`UPPER(hr.cow_tag) = UPPER($${params.length})`); }
+  if (from)    { params.push(from);    clauses.push(`${EFFECTIVE_DATE} >= $${params.length}::date`); }
+  if (to)      { params.push(to);      clauses.push(`${EFFECTIVE_DATE} <= $${params.length}::date`); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
   try {
     const { rows } = await pool.query(`
       SELECT hr.id, hr.cow_id, c.name AS cow_name, hr.cow_tag,
              hr.breed, hr.age, hr.exam_date,
+             ${EFFECTIVE_DATE} AS effective_date,
              hr.tentative_diagnosis, hr.final_diagnosis,
              hr.attending_vet, hr.source_filename, hr.uploaded_at,
              JSONB_ARRAY_LENGTH(hr.treatments) AS treatment_count
       FROM cow_health_records hr
       LEFT JOIN cows c ON c.id = hr.cow_id
       ${where}
-      ORDER BY hr.uploaded_at DESC
+      ORDER BY ${EFFECTIVE_DATE} DESC, hr.uploaded_at DESC
     `, params);
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
