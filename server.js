@@ -52,6 +52,13 @@ const corsOptions = {
   origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://bushi-farm.vercel.app'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  /* A browser hands script only a safelist of response headers unless the
+     server says otherwise, and Content-Disposition is not on it. The
+     downloads this API serves name themselves in that header — a health
+     record is named for its cow and examination date — so without this the
+     front end cannot read the name and every download falls back to one it
+     has to invent. */
+  exposedHeaders: ['Content-Disposition'],
   credentials: true,
 };
 
