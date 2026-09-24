@@ -53,6 +53,24 @@ async function resolveCowId(explicitId, tag) {
   return rows.length ? rows[0].id : null;
 }
 
+/**
+ * What a downloaded record is called on the vet's computer.
+ *
+ * Named for the animal and the day it was examined, because a folder of
+ * these is sorted and searched by eye. Anything that would upset a file
+ * system — or a Content-Disposition header — is flattened out.
+ */
+function documentFilename(record) {
+  const who  = record.cow_name || record.cow_tag || 'Unlinked';
+  const when = record.exam_date || String(record.uploaded_at || '').slice(0, 10);
+  return [`Health Record`, who, when]
+    .filter(Boolean)
+    .join(' - ')
+    .replace(/[^A-Za-z0-9 ._-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim() + '.docx';
+}
+
 /* GET /template — the blank form, as a Word document.
 
    Declared above `/:id` so the router does not read "template" as a
@@ -64,6 +82,34 @@ router.get('/template', async (req, res) => {
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     res.setHeader('Content-Disposition',
       'attachment; filename="Bushi Dairy Farm Individual Health Record.docx"');
+    res.send(buffer);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* GET /:id/document — one saved record, as a Word document.
+
+   The same sheet the vet fills, carrying what was recorded: a copy to
+   print, file, or send to whoever asked. It is the layout the importer
+   reads, so a downloaded record can be edited in Word and uploaded
+   back. */
+router.get('/:id/document', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT hr.*, c.name AS cow_name
+       FROM cow_health_records hr
+       LEFT JOIN cows c ON c.id = hr.cow_id
+       WHERE hr.id = $1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+
+    const record = rows[0];
+    const buffer = await buildHealthRecordTemplate(record);
+
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="${documentFilename(record)}"`);
     res.send(buffer);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
