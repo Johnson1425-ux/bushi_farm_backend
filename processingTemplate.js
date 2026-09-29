@@ -34,8 +34,8 @@
 
 const ExcelJS = require('exceljs');
 const {
-  RECEIVED_SOURCES, PRODUCT_ROWS, LITRES_PER_PACK, MONTHS, MONTH_NAMES,
-  canonical, daysInMonth,
+  RECEIVED_SOURCES, MONTHS, MONTH_NAMES, DEFAULT_CATALOGUE,
+  daysInMonth,
 } = require('./processingCatalog');
 
 const DAY_COL_START = 4;          // column D holds day 1
@@ -142,7 +142,7 @@ function dailyBlock(ws, startRow, days, rows, { litres }) {
     const last = colLetter(DAY_COL_START + MAX_DAYS - 1);
     formulaCell(ws, row, TOTAL_UNITS_COL, `SUM(${first}${row}:${last}${row})`);
     if (litres) {
-      const factor = LITRES_PER_PACK[canonical(r.size)] || 0;
+      const factor = r.litres_per_pack || 0;
       formulaCell(ws, row, TOTAL_LITRES_COL, `${colLetter(TOTAL_UNITS_COL)}${row}*${factor}`, '0.00');
     }
     row++;
@@ -210,7 +210,7 @@ function buildInstructions(wb) {
   return ws;
 }
 
-function buildMonthSheet(wb, monthName, year) {
+function buildMonthSheet(wb, monthName, year, rows) {
   const month = String(monthName).toUpperCase();
   const days = daysInMonth(MONTHS[month], year);
   const ws = wb.addWorksheet(`${month} ${year}`, { views: [{ showGridLines: false, state: 'frozen', xSplit: 3, ySplit: 0 }] });
@@ -255,11 +255,11 @@ function buildMonthSheet(wb, monthName, year) {
   fill(ws.getCell(row, DAY_COL_START + 1), GREEN_SOFT);
   row++;
   const openingFirst = row;
-  for (const r of PRODUCT_ROWS) {
+  for (const r of rows) {
     labelCell(ws, row, 2, r.product);
     labelCell(ws, row, 3, r.size);
     inputCell(ws, row, DAY_COL_START);
-    const factor = LITRES_PER_PACK[canonical(r.size)] || 0;
+    const factor = r.litres_per_pack || 0;
     formulaCell(ws, row, DAY_COL_START + 1, `${colLetter(DAY_COL_START)}${row}*${factor}`, '0.00');
     row++;
   }
@@ -305,7 +305,7 @@ function buildMonthSheet(wb, monthName, year) {
     dayHeader(ws, row, days, { litres: true });
     row++;
     const first = row;
-    row = dailyBlock(ws, row, days, PRODUCT_ROWS, { litres: true });
+    row = dailyBlock(ws, row, days, rows, { litres: true });
     const last = row - 1;
     blockRows[name] = { first, last };
     row = blockTotal(ws, row, first, last, `TOTAL ${name}`, { litres: true });
@@ -344,18 +344,18 @@ function buildMonthSheet(wb, monthName, year) {
   row++;
   const T = colLetter(TOTAL_UNITS_COL);
   const D = colLetter(DAY_COL_START);
-  PRODUCT_ROWS.forEach((r, i) => {
+  rows.forEach((r, i) => {
     labelCell(ws, row, 2, r.product);
     labelCell(ws, row, 3, r.size);
     const open = `${D}${openingFirst + i}`;
     const packed = `${T}${blockRows.PACKED.first + i}`;
     const damaged = `${T}${blockRows.DAMAGED.first + i}`;
     formulaCell(ws, row, DAY_COL_START, `${open}+${packed}-${damaged}`);
-    const factor = LITRES_PER_PACK[canonical(r.size)] || 0;
+    const factor = r.litres_per_pack || 0;
     formulaCell(ws, row, DAY_COL_START + 1, `${D}${row}*${factor}`, '0.00');
     row++;
   });
-  const closingFirst = row - PRODUCT_ROWS.length;
+  const closingFirst = row - rows.length;
   labelCell(ws, row, 2, 'AVAILABLE STOCK', { bold: true });
   formulaCell(ws, row, DAY_COL_START, `SUM(${D}${closingFirst}:${D}${row - 1})`);
   formulaCell(ws, row, DAY_COL_START + 1,
@@ -379,7 +379,14 @@ function buildMonthSheet(wb, monthName, year) {
  * @param {number}   [opts.year]    Defaults to the current year.
  * @returns {Promise<Buffer>} .xlsx bytes
  */
-async function buildProcessingTemplate({ months, year } = {}) {
+/**
+ * @param {object} [opts]
+ * @param {object} [opts.catalogue]  a buildCatalogue() result — the products
+ *   table as the farm has it. Only the lines still being made get a row;
+ *   retired ones stay readable by the parser but are not offered for new
+ *   months. Defaults to the list in processingCatalog.js.
+ */
+async function buildProcessingTemplate({ months, year, catalogue = DEFAULT_CATALOGUE } = {}) {
   const now = new Date();
   const y = Number(year) || now.getUTCFullYear();
 
@@ -398,7 +405,7 @@ async function buildProcessingTemplate({ months, year } = {}) {
   for (const m of sheetMonths) {
     // A December sheet followed by January belongs to the next year.
     const rollover = sheetMonths.indexOf(m) > 0 && MONTHS[m] < MONTHS[sheetMonths[0]];
-    buildMonthSheet(wb, m, rollover ? y + 1 : y);
+    buildMonthSheet(wb, m, rollover ? y + 1 : y, catalogue.activeRows);
   }
 
   const buf = await wb.xlsx.writeBuffer();
