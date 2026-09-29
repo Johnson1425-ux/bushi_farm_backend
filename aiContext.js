@@ -324,7 +324,7 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
     FROM selected
   `;
 
-  const [totals, prevTotals, daily, byBranch, byTier, legacy] = await Promise.all([
+  const [totals, prevTotals, daily, byBranch, byTier, legacy, book] = await Promise.all([
     pool.query(totalsSql, [from, to]),
     pool.query(totalsSql, [prevFrom, prevTo]),
     pool.query(`
@@ -360,6 +360,16 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
              ROUND(COALESCE(SUM(litres_sold * price_per_litre), 0)::numeric, 2) AS revenue
       FROM sales WHERE date BETWEEN $1 AND $2
     `, [from, to]),
+    /* The sales day book, read in from the farm's workbook — see
+       routes/salesBook.js. A month known only as a monthly figure is
+       dated to its 1st. */
+    pool.query(`
+      SELECT unit, unit_kind AS kind,
+             ROUND(SUM(amount)::numeric, 2) AS amount,
+             BOOL_OR(whole_month)           AS includes_whole_months
+      FROM sales_book_entries WHERE entry_date BETWEEN $1 AND $2
+      GROUP BY unit, unit_kind ORDER BY amount DESC
+    `, [from, to]),
   ]);
 
   const shape = (r) => ({
@@ -387,6 +397,20 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
   /* Only when the period actually has hand-kept rows. Reporting a block of
      zeroes for every month since the till went in would read as a decline
      that never happened. */
+  /* Same rule for the sales book: only when the period has lines in it. */
+  if (book.rows.length) {
+    out.sales_book = {
+      note: 'Sales from the farm\'s sales day book workbook, by unit (shops, sales people '
+          + 'and bulk buyers) — kept until the sales people record in the app. Not part of the '
+          + 'till totals above; do not add the two unless the till is empty for the period.'
+          + (book.rows.some(r => r.includes_whole_months)
+            ? ' Some months are known only as a whole-month figure, counted in full if the period includes their 1st.'
+            : ''),
+      total: num(book.rows.reduce((a, r) => a + num(r.amount), 0)),
+      by_unit: book.rows.map(r => ({ unit: r.unit, kind: r.kind, amount: num(r.amount) })),
+    };
+  }
+
   const old = legacy.rows[0];
   if (old.entries > 0) {
     out.legacy_bulk_milk = {

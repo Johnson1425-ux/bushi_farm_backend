@@ -16,6 +16,7 @@ const { initStockTables } = require('./lib/initStock');
 const { initPosTables }   = require('./lib/initPos');
 const { initCustomerTables } = require('./lib/initCustomers');
 const { initExpenseTables }  = require('./lib/initExpenses');
+const { initSalesBookTables } = require('./lib/initSalesBook');
 const { initRefreshTokenTables, purgeExpiredTokens } = require('./lib/refreshTokens');
 const { ALLOWED_ORIGINS } = require('./lib/origins');
 
@@ -35,6 +36,7 @@ const pregnanciesRoutes = require('./routes/pregnancies');
 const calvesRoutes      = require('./routes/calves');
 const alertsRoutes      = require('./routes/alerts');
 const salesRoutes       = require('./routes/sales');
+const salesBookRoutes   = require('./routes/salesBook');
 const inventoryRoutes   = require('./routes/inventory');
 const processingRoutes  = require('./routes/processing');
 const healthRecordsRoutes = require('./routes/healthRecords');
@@ -82,7 +84,7 @@ app.use(express.json());
 
 /* Start the schema work now, so a warm process has it done already. */
 const initAllTables = () => Promise.all([
-  initAiTables(), initHealthRecordsTables(), initExpenseTables(),
+  initAiTables(), initHealthRecordsTables(), initExpenseTables(), initSalesBookTables(),
   /* calves references pregnancies, which initNewTables creates. */
   initNewTables().then(initCalvesTable),
   /* Sessions live here. Spent and long-expired rows are swept on the way
@@ -143,6 +145,9 @@ app.use('/api/auth', authRoutes);
 
 /* Manager territory. */
 app.use('/api/sales',      verifyToken, requireProduction, salesRoutes);
+/* The sales day book, read in from the workbook until the sales people
+   record in the app. Management's, like the reports it sits beside. */
+app.use('/api/sales-book', verifyToken, requireProduction, salesBookRoutes);
 app.use('/api/inventory',  verifyToken, requireProduction, inventoryRoutes);
 app.use('/api/processing', verifyToken, requireProduction, processingRoutes);
 app.use('/api/import',     verifyToken, requireProduction, importRoutes);
