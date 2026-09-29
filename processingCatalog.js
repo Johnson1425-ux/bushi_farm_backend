@@ -109,6 +109,75 @@ function litresFor(size, units) {
   return Math.round(factor * Number(units || 0) * 1000) / 1000;
 }
 
+/* ── a catalogue built from the products table ─────────────
+
+   The lists above are what the unit made when the app was written, and
+   they seed the products table on first boot. From then on the table is
+   the catalogue: a manager adds a product in the app, and the parser and
+   the template read it from there. buildCatalogue() turns table rows into
+   the same lookups the constants above provide, so the parser does not
+   care which one it was handed. */
+
+/** Best guess at litres per pack from a size label, or null. "250ML" -> 0.25, "1L" -> 1. */
+function guessLitresPerPack(size) {
+  const c = canonical(size);
+  if (LITRES_PER_PACK[c]) return LITRES_PER_PACK[c];
+  const m = /(\d*\.?\d+)\s*(ML|LTR|LITRES?|L)\b/.exec(c);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!(n > 0)) return null;
+  return m[2] === 'ML' ? Math.round(n) / 1000 : n;
+}
+
+const keyOf = (product, size) => `${canonical(product)}|${canonical(size)}`;
+
+/**
+ * @param {Array<{product, size, litres_per_pack?, active?}>} rows  in sheet order
+ * @returns {{ rows, activeRows, lookup(product, size), litresFor(size, units, product?) }}
+ */
+function buildCatalogue(rows) {
+  const entries = [];
+  const byKey = new Map();
+  const bySize = new Map();
+  for (const r of rows) {
+    const k = keyOf(r.product, r.size);
+    if (byKey.has(k)) continue;
+    const factor = Number(r.litres_per_pack) || guessLitresPerPack(r.size) || 0;
+    const e = { product: r.product, size: r.size, litres_per_pack: factor, active: r.active !== false };
+    entries.push(e);
+    byKey.set(k, e);
+    if (factor && !bySize.has(canonical(r.size))) bySize.set(canonical(r.size), factor);
+  }
+
+  const factorOf = (size, product) => {
+    const e = product != null ? byKey.get(keyOf(product, size)) : null;
+    if (e && e.litres_per_pack) return e.litres_per_pack;
+    return bySize.get(canonical(size)) || LITRES_PER_PACK[canonical(size)] || 0;
+  };
+
+  return {
+    rows: entries,
+    activeRows: entries.filter(e => e.active),
+    /** The catalogue's own spelling of a (product, size) pair, or null. */
+    lookup(product, size) {
+      const e = byKey.get(keyOf(product, size));
+      return e ? { product: e.product, size: e.size } : null;
+    },
+    /** Litres in `units` packs. Pass the product when it is known: two
+        products may one day share a size label and not its volume. */
+    litresFor(size, units, product) {
+      const factor = factorOf(size, product);
+      if (!factor) return 0;
+      return Math.round(factor * Number(units || 0) * 1000) / 1000;
+    },
+  };
+}
+
+/** The catalogue as the code defines it, for callers with no database to hand. */
+const DEFAULT_CATALOGUE = buildCatalogue(
+  PRODUCT_ROWS.map(r => ({ ...r, litres_per_pack: LITRES_PER_PACK[canonical(r.size)] }))
+);
+
 /** Days in a given month, so a 31st-day entry in June can be rejected. */
 function daysInMonth(monthNum, year) {
   if (!monthNum || !year) return 31;
@@ -133,5 +202,8 @@ module.exports = {
   canonical,
   lookupProductRow,
   litresFor,
+  guessLitresPerPack,
+  buildCatalogue,
+  DEFAULT_CATALOGUE,
   daysInMonth,
 };

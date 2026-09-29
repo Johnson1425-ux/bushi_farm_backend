@@ -3,7 +3,7 @@ const multer  = require('multer');
 const { pool } = require('../db');
 const { parseProcessingWorkbook } = require('../processingParser');
 const { buildProcessingTemplate } = require('../processingTemplate');
-const { litresFor } = require('../processingCatalog');
+const { loadCatalogue } = require('../lib/products');
 const { reconcileUpload } = require('../lib/processingReconcile');
 
 const router = express.Router();
@@ -34,7 +34,7 @@ router.get('/', async (req, res) => {
 
 /* Download the blank workbook.
 
-   Generated on demand from the same catalogue the parser validates against,
+   Generated on demand from the same products table the parser validates against,
    so the sheet someone types into can never expect different products from
    the sheet the app reads back. Registered before the /:id route below,
    which would otherwise swallow "template" as an id. */
@@ -45,7 +45,7 @@ router.get('/template', async (req, res) => {
       : undefined;
     const year = req.query.year ? parseInt(req.query.year, 10) : undefined;
 
-    const buffer = await buildProcessingTemplate({ months, year });
+    const buffer = await buildProcessingTemplate({ months, year, catalogue: await loadCatalogue() });
     const name = `MilkTrack_Processing_${year || new Date().getUTCFullYear()}.xlsx`;
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -94,7 +94,8 @@ router.get('/:id', async (req, res) => {
       ),
     ]);
 
-    const reconciled = await reconcileUpload(uploadRes.rows[0], stock.rows, { litresFor });
+    const cat = await loadCatalogue();
+    const reconciled = await reconcileUpload(uploadRes.rows[0], stock.rows, { litresFor: cat.litresFor });
 
     res.json({
       upload:   uploadRes.rows[0],
@@ -130,13 +131,17 @@ router.get('/:id', async (req, res) => {
 router.post('/upload', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  const parsed = parseProcessingWorkbook(req.file.buffer);
+  let parsed;
+  try {
+    parsed = parseProcessingWorkbook(req.file.buffer, { catalogue: await loadCatalogue() });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
 
   if (!parsed.ok) {
     return res.status(422).json({
       error:  'The workbook could not be imported. Fix the issues below and re-upload.',
       issues: parsed.errors,
       warnings: parsed.warnings,
+      unknown_products: parsed.unknown_products,
     });
   }
 
@@ -246,6 +251,9 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       // The client shows the newest month it just imported.
       upload_id:       results[0]?.upload_id ?? null,
       warnings:        parsed.warnings,
+      /* Rows naming a product the app does not know, one entry per product,
+         so the page can offer to add each and have the month sent again. */
+      unknown_products: parsed.unknown_products,
     });
   } catch (err) {
     await client.query('ROLLBACK');

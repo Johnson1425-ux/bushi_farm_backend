@@ -14,7 +14,7 @@
 const { pool } = require('./db');
 const { balance } = require('./lib/inventoryLedger');
 const { applyIssued, issuedForUpload } = require('./lib/processingReconcile');
-const { litresFor } = require('./processingCatalog');
+const { loadCatalogue } = require('./lib/products');
 const { COLUMNS: HEALTH_RECORD_COLUMNS } = require('./lib/healthRecordForm');
 
 /* ── helpers ─────────────────────────────────────────────── */
@@ -661,6 +661,7 @@ async function processingContext(limit = 2) {
   const byUpload = (rows, id) => rows.filter(r => r.upload_id === id)
     .map(({ upload_id, ...rest }) => rest);
 
+  const { litresFor } = await loadCatalogue();
   const months = uploads.map((u) => {
     const rec = byUpload(received.rows, u.id)[0] || null;
     const p = byUpload(packed.rows, u.id);
@@ -803,7 +804,7 @@ async function processingMonth(label) {
     daily_packed: packed.rows,
     daily_issued: issued.rows,
     daily_damaged: damaged.rows,
-    stock_by_product: applyIssued(stock.rows, issued.rows, { litresFor }),
+    stock_by_product: applyIssued(stock.rows, issued.rows, { litresFor: (await loadCatalogue()).litresFor }),
   };
 }
 
@@ -1063,7 +1064,7 @@ async function alertSignals() {
       [procRows[0].id]
     );
     const { issued } = await issuedForUpload(pool, procRows[0]);
-    return applyIssued(stockRows, issued, { litresFor })
+    return applyIssued(stockRows, issued, { litresFor: (await loadCatalogue()).litresFor })
       .filter(r => num0(r.units) < 0)
       .map(r => ({ product: r.product, size: r.size, closing_units: num0(r.units) }));
   })() : [];
