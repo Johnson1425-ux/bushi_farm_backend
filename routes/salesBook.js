@@ -207,6 +207,113 @@ router.delete('/imports/:id', async (req, res) => {
 });
 
 /* ══════════════════════════════════
+   THE UNITS — each shop, sales person and bulk buyer on its own,
+   the way a category opens on the expenses page.
+══════════════════════════════════ */
+
+router.get('/units', async (req, res) => {
+  const year = parseInt(req.query.year, 10) || new Date().getUTCFullYear();
+  try {
+    const { rows } = await pool.query(`
+      SELECT unit, unit_kind AS kind,
+             COALESCE(SUM(amount), 0)                                           AS total,
+             COALESCE(SUM(amount) FILTER (WHERE EXTRACT(YEAR FROM entry_date) = $1), 0) AS year_total,
+             COUNT(*) FILTER (WHERE NOT whole_month)::int                        AS days,
+             COUNT(DISTINCT TO_CHAR(entry_date, 'YYYY-MM'))::int                 AS months,
+             TO_CHAR(MIN(entry_date), 'YYYY-MM-DD')                              AS first_date,
+             TO_CHAR(MAX(entry_date) FILTER (WHERE NOT whole_month), 'YYYY-MM-DD') AS last_day
+      FROM sales_book_entries
+      GROUP BY unit, unit_kind
+    `, [year]);
+    const units = rows.map(r => ({ ...r, total: num(r.total), year_total: num(r.year_total) })).sort(byUnit);
+    const yearTotal = money(units.reduce((a, u) => a + u.year_total, 0));
+    res.json({ year, year_total: yearTotal, units });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/**
+ * One unit, month by month, with the days behind each month.
+ *
+ * Every month of the year is listed, sold in or not: a sales person who
+ * went quiet for two months is a reading, and a table that left those
+ * months out would hide it.
+ */
+router.get('/units/:unit', async (req, res) => {
+  const unit = req.params.unit;
+  const year = parseInt(req.query.year, 10) || new Date().getUTCFullYear();
+  try {
+    const [entries, byYear, whole] = await Promise.all([
+      pool.query(`
+        SELECT TO_CHAR(entry_date, 'YYYY-MM-DD') AS date, amount, whole_month, source_ref, unit_kind AS kind
+        FROM sales_book_entries
+        WHERE unit = $1 AND EXTRACT(YEAR FROM entry_date) = $2
+        ORDER BY entry_date
+      `, [unit, year]),
+      pool.query(`
+        SELECT EXTRACT(YEAR FROM entry_date)::int AS year, SUM(amount) AS total
+        FROM sales_book_entries WHERE unit = $1
+        GROUP BY year ORDER BY year DESC
+      `, [unit]),
+      /* Every unit together, month by month, for this unit's share. */
+      pool.query(`
+        SELECT EXTRACT(MONTH FROM entry_date)::int AS month, SUM(amount) AS total
+        FROM sales_book_entries WHERE EXTRACT(YEAR FROM entry_date) = $1
+        GROUP BY month
+      `, [year]),
+    ]);
+
+    if (!byYear.rows.length) return res.status(404).json({ error: `Nothing in the sales book for ${unit}` });
+
+    const allByMonth = Array(12).fill(0);
+    for (const r of whole.rows) allByMonth[r.month - 1] = num(r.total);
+
+    const months = Array.from({ length: 12 }, (_, i) => ({
+      month: i + 1, total: 0, days: [], whole_month: false, share: 0,
+    }));
+    let kind = null;
+    for (const e of entries.rows) {
+      kind = e.kind;
+      const m = months[Number(e.date.slice(5, 7)) - 1];
+      const amount = num(e.amount);
+      m.total = money(m.total + amount);
+      if (e.whole_month) m.whole_month = true;
+      else m.days.push({ date: e.date, amount, source_ref: e.source_ref });
+    }
+    for (const m of months) {
+      const all = allByMonth[m.month - 1];
+      m.share = all ? Math.round((m.total / all) * 1000) / 10 : 0;
+    }
+
+    const sold = months.filter(m => m.total);
+    const total = money(sold.reduce((a, m) => a + m.total, 0));
+    /* The month still being written is left out of the average — seven
+       days of September would drag it down. */
+    const now = new Date();
+    const openMonth = year === now.getUTCFullYear() ? now.getUTCMonth() + 1 : null;
+    const finished = sold.filter(m => m.month !== openMonth);
+    const days = sold.flatMap(m => m.days);
+    const bestDay = days.reduce((a, d) => (d.amount > (a?.amount || 0) ? d : a), null);
+    const yearAll = allByMonth.reduce((a, b) => a + b, 0);
+
+    res.json({
+      unit, kind: kind || (await pool.query(
+        'SELECT unit_kind FROM sales_book_entries WHERE unit = $1 LIMIT 1', [unit]
+      )).rows[0]?.unit_kind,
+      year, months, total,
+      share: yearAll ? Math.round((total / yearAll) * 1000) / 10 : 0,
+      /* Over the months it actually sold in — dividing by twelve in
+         September would make every unit look half what it is. */
+      monthly_average: finished.length ? money(finished.reduce((a, m) => a + m.total, 0) / finished.length) : 0,
+      best_month: sold.length ? sold.reduce((a, m) => (m.total > a.total ? m : a)).month : null,
+      days_recorded: days.length,
+      daily_average: days.length ? money(days.reduce((a, d) => a + d.amount, 0) / days.length) : 0,
+      best_day: bestDay,
+      years: byYear.rows.map(r => ({ year: r.year, total: num(r.total) })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* ══════════════════════════════════
    THE YEAR — a unit per row, a month per column,
    the way MONTHLY SALES BY UNITY is laid out.
 ══════════════════════════════════ */
