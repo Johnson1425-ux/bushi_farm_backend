@@ -97,9 +97,18 @@ router.post('/import', upload.single('file'), async (req, res) => {
     const dayMonths   = parsed.months.filter(m => m.detail === 'day').map(m => m.month);
     const wholeMonths = parsed.months.filter(m => m.detail === 'month').map(m => m.month);
 
+    /* Whatever an earlier upload read off the same daily sheets goes too,
+       whichever month it was filed under. A sheet read wrongly once — a
+       date that came in a day early and landed in the month before — is
+       otherwise left behind, and would stop that month's summary figure
+       from ever replacing it. */
+    const daySheets = parsed.sheets.filter(s => s.kind === 'day').map(s => `${s.sheet}!`);
     const replaced = await client.query(
-      `DELETE FROM sales_book_entries WHERE TO_CHAR(entry_date, 'YYYY-MM') = ANY($1::text[])
-       RETURNING TO_CHAR(entry_date, 'YYYY-MM') AS month`, [dayMonths]
+      `DELETE FROM sales_book_entries
+       WHERE TO_CHAR(entry_date, 'YYYY-MM') = ANY($1::text[])
+          OR (whole_month = FALSE AND EXISTS (
+                SELECT 1 FROM UNNEST($2::text[]) p WHERE STARTS_WITH(source_ref, p)))
+       RETURNING TO_CHAR(entry_date, 'YYYY-MM') AS month`, [dayMonths, daySheets]
     );
 
     /* Summary-only months that already have days behind them keep them. */
