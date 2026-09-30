@@ -22,6 +22,7 @@ const upload = multer({
 
 const num   = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const money = (v) => Math.round(num(v) * 100) / 100;
+const litre = (v) => Math.round(num(v) * 100) / 100;
 
 const KIND_ORDER = { shop: 0, seller: 1, bulk: 2 };
 
@@ -41,6 +42,7 @@ router.get('/imports', async (req, res) => {
     const { rows } = await pool.query(`
       SELECT i.id, i.filename, i.sheets, i.uploaded_at, u.username AS uploaded_by,
              COUNT(e.id)::int                  AS entry_count,
+             (SELECT COALESCE(SUM(t.litres), 0) FROM sales_book_items t WHERE t.import_id = i.id) AS litres,
              COALESCE(SUM(e.amount), 0)        AS total,
              TO_CHAR(MIN(e.entry_date), 'YYYY-MM') AS first_month,
              TO_CHAR(MAX(e.entry_date), 'YYYY-MM') AS last_month
@@ -56,7 +58,7 @@ router.get('/imports', async (req, res) => {
       return monthLabel(m, y);
     };
     res.json(rows.map(r => ({
-      ...r, total: num(r.total),
+      ...r, total: num(r.total), litres: num(r.litres),
       covers: r.first_month === r.last_month
         ? label(r.first_month)
         : `${label(r.first_month)} – ${label(r.last_month)}`,
@@ -147,9 +149,36 @@ router.post('/import', upload.single('file'), async (req, res) => {
       );
     }
 
+    /* The day books' lines: a day's lines are replaced as a unit, as is
+       anything an earlier upload read off a sheet of the same name. */
+    const items = parsed.items;
+    const bookDays = parsed.books.map(b => b.date);
+    const bookSheets = parsed.books.map(b => `${b.sheet}!`);
+    await client.query(
+      `DELETE FROM sales_book_items
+       WHERE entry_date = ANY($1::date[])
+          OR EXISTS (SELECT 1 FROM UNNEST($2::text[]) p WHERE STARTS_WITH(source_ref, p))`,
+      [bookDays, bookSheets]
+    );
+    if (items.length) {
+      await client.query(
+        `INSERT INTO sales_book_items
+           (import_id, entry_date, unit, unit_kind, sold_by, product, pack, units, price, amount, litres, source_ref)
+         SELECT $1, d, u, k, sb, p, pk, n, pr, a, l, r
+         FROM UNNEST($2::date[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+                     $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[], $12::text[])
+              AS t(d, u, k, sb, p, pk, n, pr, a, l, r)`,
+        [imp.id,
+         items.map(i => i.date), items.map(i => i.unit), items.map(i => i.kind), items.map(i => i.sold_by),
+         items.map(i => i.product), items.map(i => i.pack), items.map(i => i.units), items.map(i => i.price),
+         items.map(i => i.amount), items.map(i => i.litres), items.map(i => `${i.sheet}!${i.cell}`)]
+      );
+    }
+
     const emptied = await client.query(`
       DELETE FROM sales_book_imports i
       WHERE NOT EXISTS (SELECT 1 FROM sales_book_entries e WHERE e.import_id = i.id)
+        AND NOT EXISTS (SELECT 1 FROM sales_book_items t WHERE t.import_id = i.id)
       RETURNING id
     `);
 
@@ -189,6 +218,8 @@ router.post('/import', upload.single('file'), async (req, res) => {
       import_id: emptied.rows.some(r => r.id === imp.id) ? null : imp.id,
       entries: entries.length,
       total: money(entries.reduce((a, e) => a + e.amount, 0)),
+      litres: parsed.litres,
+      books: parsed.books,
       months: parsed.months.map(m => ({ ...m, kept_earlier_detail: keep.has(m.month) })),
       replaced_months: replacedMonths,
       removed_imports: emptied.rows.filter(r => r.id !== imp.id).length,
@@ -234,9 +265,18 @@ router.get('/units', async (req, res) => {
       FROM sales_book_entries
       GROUP BY unit, unit_kind
     `, [year]);
-    const units = rows.map(r => ({ ...r, total: num(r.total), year_total: num(r.year_total) })).sort(byUnit);
+    const { rows: lit } = await pool.query(`
+      SELECT unit, SUM(litres) AS litres, COUNT(DISTINCT entry_date)::int AS litre_days
+      FROM sales_book_items WHERE EXTRACT(YEAR FROM entry_date) = $1
+      GROUP BY unit
+    `, [year]);
+    const litresOf = new Map(lit.map(r => [r.unit, r]));
+    const units = rows.map(r => ({
+      ...r, total: num(r.total), year_total: num(r.year_total),
+      year_litres: litre(litresOf.get(r.unit)?.litres), litre_days: litresOf.get(r.unit)?.litre_days || 0,
+    })).sort(byUnit);
     const yearTotal = money(units.reduce((a, u) => a + u.year_total, 0));
-    res.json({ year, year_total: yearTotal, units });
+    res.json({ year, year_total: yearTotal, year_litres: litre(units.reduce((a, u) => a + u.year_litres, 0)), units });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -251,7 +291,7 @@ router.get('/units/:unit', async (req, res) => {
   const unit = req.params.unit;
   const year = parseInt(req.query.year, 10) || new Date().getUTCFullYear();
   try {
-    const [entries, byYear, whole] = await Promise.all([
+    const [entries, byYear, whole, lines] = await Promise.all([
       pool.query(`
         SELECT TO_CHAR(entry_date, 'YYYY-MM-DD') AS date, amount, whole_month, source_ref, unit_kind AS kind
         FROM sales_book_entries
@@ -269,6 +309,13 @@ router.get('/units/:unit', async (req, res) => {
         FROM sales_book_entries WHERE EXTRACT(YEAR FROM entry_date) = $1
         GROUP BY month
       `, [year]),
+      /* The day books' lines, for the litres. */
+      pool.query(`
+        SELECT TO_CHAR(entry_date, 'YYYY-MM-DD') AS date, product, pack, units, price, amount, litres, sold_by
+        FROM sales_book_items
+        WHERE unit = $1 AND EXTRACT(YEAR FROM entry_date) = $2
+        ORDER BY entry_date, id
+      `, [unit, year]),
     ]);
 
     if (!byYear.rows.length) return res.status(404).json({ error: `Nothing in the sales book for ${unit}` });
@@ -287,6 +334,44 @@ router.get('/units/:unit', async (req, res) => {
       m.total = money(m.total + amount);
       if (e.whole_month) m.whole_month = true;
       else m.days.push({ date: e.date, amount, source_ref: e.source_ref });
+    }
+    /* Litres by day, and the products that made them. A day with money
+       but no day book simply has no litres — it is not a day of zero. */
+    const litresByDay = new Map();
+    const products = new Map();
+    for (const l of lines.rows) {
+      const d = litresByDay.get(l.date) || { litres: 0, lines: [] };
+      d.litres = litre(d.litres + num(l.litres));
+      d.lines.push({
+        product: l.product, pack: l.pack, units: num(l.units), price: l.price === null ? null : num(l.price),
+        amount: num(l.amount), litres: num(l.litres), sold_by: l.sold_by,
+      });
+      litresByDay.set(l.date, d);
+
+      const key = `${l.product}|${l.pack}`;
+      const p = products.get(key) || { product: l.product, pack: l.pack, units: 0, litres: 0, amount: 0 };
+      p.units = litre(p.units + num(l.units));
+      p.litres = litre(p.litres + num(l.litres));
+      p.amount = money(p.amount + num(l.amount));
+      products.set(key, p);
+    }
+    for (const m of months) {
+      m.litres = 0; m.litre_days = 0;
+      for (const d of m.days) {
+        const l = litresByDay.get(d.date);
+        d.litres = l ? l.litres : null;
+        d.lines = l ? l.lines : [];
+        if (l) { m.litres = litre(m.litres + l.litres); m.litre_days++; }
+      }
+    }
+    /* A day book for a day the money sheet has nothing on — the litres
+       still belong to the month. */
+    for (const [date, l] of litresByDay) {
+      const m = months[Number(date.slice(5, 7)) - 1];
+      if (m.days.some(d => d.date === date)) continue;
+      m.days.push({ date, amount: 0, source_ref: null, litres: l.litres, lines: l.lines });
+      m.days.sort((a, b) => a.date.localeCompare(b.date));
+      m.litres = litre(m.litres + l.litres); m.litre_days++;
     }
     for (const m of months) {
       const all = allByMonth[m.month - 1];
@@ -315,6 +400,10 @@ router.get('/units/:unit', async (req, res) => {
       monthly_average: finished.length ? money(finished.reduce((a, m) => a + m.total, 0) / finished.length) : 0,
       best_month: sold.length ? sold.reduce((a, m) => (m.total > a.total ? m : a)).month : null,
       days_recorded: days.length,
+      litres: litre(months.reduce((a, m) => a + m.litres, 0)),
+      litre_days: litresByDay.size,
+      litres_per_day: litresByDay.size ? litre(months.reduce((a, m) => a + m.litres, 0) / litresByDay.size) : 0,
+      products: [...products.values()].sort((a, b) => b.litres - a.litres),
       daily_average: days.length ? money(days.reduce((a, d) => a + d.amount, 0) / days.length) : 0,
       best_day: bestDay,
       years: byYear.rows.map(r => ({ year: r.year, total: num(r.total) })),
@@ -370,6 +459,21 @@ router.get('/year', async (req, res) => {
       detail[r.month - 1] = detail[r.month - 1] === 'day' || !r.whole_month ? 'day' : 'month';
     }
 
+    const lit = await pool.query(`
+      SELECT unit, EXTRACT(MONTH FROM entry_date)::int AS month, SUM(litres) AS litres
+      FROM sales_book_items WHERE EXTRACT(YEAR FROM entry_date) = $1
+      GROUP BY unit, month
+    `, [year]);
+    const litresByMonth = Array(12).fill(0);
+    for (const r of lit.rows) {
+      litresByMonth[r.month - 1] = litre(litresByMonth[r.month - 1] + num(r.litres));
+      const u = units.get(r.unit);
+      if (u) {
+        u.litres_by_month = u.litres_by_month || Array(12).fill(0);
+        u.litres_by_month[r.month - 1] = litre(num(r.litres));
+      }
+    }
+
     const tillMonths = Array(12).fill(0);
     for (const r of till.rows) tillMonths[r.month - 1] = money(num(r.amount));
 
@@ -380,6 +484,7 @@ router.get('/year', async (req, res) => {
       detail,
       total: money(months.reduce((a, b) => a + b, 0)),
       till: tillMonths,
+      litres: litresByMonth,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -398,7 +503,7 @@ router.get('/month', async (req, res) => {
   const to   = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
 
   try {
-    const [book, till] = await Promise.all([
+    const [book, till, lit] = await Promise.all([
       pool.query(`
         SELECT TO_CHAR(entry_date, 'YYYY-MM-DD') AS day, unit, unit_kind AS kind,
                amount, whole_month, source_ref
@@ -412,7 +517,28 @@ router.get('/month', async (req, res) => {
         WHERE status = 'completed' AND sold_on BETWEEN $1 AND $2
         GROUP BY sold_on
       `, [from, to]),
+      pool.query(`
+        SELECT TO_CHAR(entry_date, 'YYYY-MM-DD') AS day, unit, unit_kind AS kind, SUM(litres) AS litres
+        FROM sales_book_items
+        WHERE entry_date BETWEEN $1 AND $2
+        GROUP BY entry_date, unit, unit_kind
+      `, [from, to]),
     ]);
+
+    /* Litres, laid out the same way as the money: a day per row, a unit
+       per column. Only the days with a day book have any. */
+    const litreUnits = new Map();
+    const litreDays = new Map();
+    for (const r of lit.rows) {
+      const l = num(r.litres);
+      const u = litreUnits.get(r.unit) || { unit: r.unit, kind: r.kind, total: 0 };
+      u.total = litre(u.total + l);
+      litreUnits.set(r.unit, u);
+      const d = litreDays.get(r.day) || { day: r.day, by_unit: {}, total: 0 };
+      d.by_unit[r.unit] = litre((d.by_unit[r.unit] || 0) + l);
+      d.total = litre(d.total + l);
+      litreDays.set(r.day, d);
+    }
 
     const wholeMonth = book.rows.length > 0 && book.rows.every(r => r.whole_month);
 
@@ -440,6 +566,59 @@ router.get('/month', async (req, res) => {
       total: money([...units.values()].reduce((a, u) => a + u.total, 0)),
       till: tillByDay,
       till_total: money(Object.values(tillByDay).reduce((a, b) => a + b, 0)),
+      litres: {
+        units: [...litreUnits.values()].sort(byUnit),
+        days: [...litreDays.values()].sort((a, b) => a.day.localeCompare(b.day)),
+        total: litre([...litreUnits.values()].reduce((a, u) => a + u.total, 0)),
+      },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* ══════════════════════════════════
+   ONE DAY — what each unit took out, product by product,
+   the way that day's day book is laid out.
+══════════════════════════════════ */
+
+router.get('/day', async (req, res) => {
+  const date = String(req.query.date || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  try {
+    const [items, money_] = await Promise.all([
+      pool.query(`
+        SELECT unit, unit_kind AS kind, sold_by, product, pack, units, price, amount, litres, source_ref
+        FROM sales_book_items WHERE entry_date = $1 ORDER BY id
+      `, [date]),
+      pool.query(`
+        SELECT unit, unit_kind AS kind, amount FROM sales_book_entries
+        WHERE entry_date = $1 AND whole_month = FALSE
+      `, [date]),
+    ]);
+
+    const units = new Map();
+    const get = (unit, kind) => {
+      if (!units.has(unit)) units.set(unit, { unit, kind, amount: 0, litres: 0, booked: 0, lines: [] });
+      return units.get(unit);
+    };
+    for (const r of money_.rows) get(r.unit, r.kind).amount = money(get(r.unit, r.kind).amount + num(r.amount));
+    for (const r of items.rows) {
+      const u = get(r.unit, r.kind);
+      u.litres = litre(u.litres + num(r.litres));
+      u.booked = money(u.booked + num(r.amount));
+      u.lines.push({
+        product: r.product, pack: r.pack, units: num(r.units),
+        price: r.price === null ? null : num(r.price), amount: num(r.amount), litres: num(r.litres),
+        sold_by: r.sold_by, source_ref: r.source_ref,
+      });
+    }
+
+    const list = [...units.values()].sort(byUnit);
+    res.json({
+      date,
+      has_day_book: items.rows.length > 0,
+      units: list,
+      amount: money(list.reduce((a, u) => a + u.amount, 0)),
+      litres: litre(list.reduce((a, u) => a + u.litres, 0)),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

@@ -364,11 +364,13 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
        routes/salesBook.js. A month known only as a monthly figure is
        dated to its 1st. */
     pool.query(`
-      SELECT unit, unit_kind AS kind,
-             ROUND(SUM(amount)::numeric, 2) AS amount,
-             BOOL_OR(whole_month)           AS includes_whole_months
-      FROM sales_book_entries WHERE entry_date BETWEEN $1 AND $2
-      GROUP BY unit, unit_kind ORDER BY amount DESC
+      SELECT e.unit, e.unit_kind AS kind,
+             ROUND(SUM(e.amount)::numeric, 2) AS amount,
+             BOOL_OR(e.whole_month)           AS includes_whole_months,
+             (SELECT ROUND(SUM(i.litres)::numeric, 1) FROM sales_book_items i
+               WHERE i.unit = e.unit AND i.entry_date BETWEEN $1 AND $2) AS litres
+      FROM sales_book_entries e WHERE e.entry_date BETWEEN $1 AND $2
+      GROUP BY e.unit, e.unit_kind ORDER BY amount DESC
     `, [from, to]),
   ]);
 
@@ -407,7 +409,12 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
             ? ' Some months are known only as a whole-month figure, counted in full if the period includes their 1st.'
             : ''),
       total: num(book.rows.reduce((a, r) => a + num(r.amount), 0)),
-      by_unit: book.rows.map(r => ({ unit: r.unit, kind: r.kind, amount: num(r.amount) })),
+      /* Litres only for the days that have a day book; null means none
+         was kept, not that nothing was sold. */
+      by_unit: book.rows.map(r => ({
+        unit: r.unit, kind: r.kind, amount: num(r.amount),
+        litres_from_day_books: r.litres === null ? null : num(r.litres),
+      })),
     };
   }
 
