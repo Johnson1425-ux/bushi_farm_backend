@@ -191,6 +191,19 @@ async function initAiTables() {
     CREATE INDEX IF NOT EXISTS idx_ai_reports_kind    ON ai_reports(kind);
     CREATE INDEX IF NOT EXISTS idx_ai_reports_created ON ai_reports(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_ai_reports_cow     ON ai_reports(cow_id);
+
+    -- Each chat answer as it finishes, so a page whose stream broke on the
+    -- way can still collect it. Short-lived: kept for two days.
+    CREATE TABLE IF NOT EXISTS ai_chat_answers (
+      id           TEXT PRIMARY KEY,
+      user_id      INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      -- 'running' | 'done' | 'error'
+      status       TEXT NOT NULL DEFAULT 'running',
+      content      TEXT,
+      error        TEXT,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      finished_at  TIMESTAMPTZ
+    );
   `);
   console.log('✓ AI reports table ready');
 }
@@ -263,8 +276,46 @@ async function findTodaysReport(kind, cowId = null) {
   return rows[0] || null;
 }
 
+/* ══════════════════════════════════
+   PERSISTENCE — ai_chat_answers
+══════════════════════════════════ */
+
+async function startChatAnswer(id, userId) {
+  await pool.query(`DELETE FROM ai_chat_answers WHERE created_at < NOW() - INTERVAL '2 days'`);
+  await pool.query(
+    `INSERT INTO ai_chat_answers (id, user_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+    [id, userId],
+  );
+}
+
+async function finishChatAnswer(id, { content = '', error = null }) {
+  await pool.query(`
+    UPDATE ai_chat_answers
+    SET status = $2, content = $3, error = $4, finished_at = NOW()
+    WHERE id = $1
+  `, [id, error ? 'error' : 'done', content, error]);
+}
+
+/** One user's answer. A row still running after the chat deadline was cut off by the host. */
+async function getChatAnswer(id, userId, staleAfterMs) {
+  const { rows } = await pool.query(`
+    SELECT status, content, error,
+           created_at < NOW() - ($3::int * INTERVAL '1 millisecond') AS stale
+    FROM ai_chat_answers WHERE id = $1 AND user_id = $2
+  `, [id, userId, staleAfterMs]);
+  const row = rows[0];
+  if (!row) return null;
+  if (row.status === 'running' && row.stale) {
+    return { status: 'error', content: row.content || '', error: 'The answer was cut off before it finished. Try again.' };
+  }
+  return { status: row.status, content: row.content || '', error: row.error };
+}
+
 Object.assign(module.exports, {
   initAiTables,
+  startChatAnswer,
+  finishChatAnswer,
+  getChatAnswer,
   saveReport,
   listReports,
   getReport,

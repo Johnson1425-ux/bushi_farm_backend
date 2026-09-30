@@ -11,6 +11,7 @@
    GET    /api/ai/cows/:id/summary       latest saved cow summary
    POST   /api/ai/cows/:id/summary       generate cow summary      (SSE)
    POST   /api/ai/chat                   ask-the-data chat         (SSE)
+   GET    /api/ai/chat/:id               a chat answer, if its stream broke
 
    Generation endpoints stream Server-Sent Events so the UI can render
    text as it is written instead of waiting on a long request.
@@ -768,29 +769,55 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
     content: `Today is ${new Date().toISOString().slice(0, 10)}.\n\n${question}`,
   });
 
+  /* The page names each question so it can collect the answer later if the
+     stream breaks on the way — the server can finish while the phone never
+     hears the end of it. */
+  const rawId = req.body?.request_id;
+  const answerId = typeof rawId === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(rawId) ? rawId : null;
+  if (answerId) {
+    await ai.startChatAnswer(answerId, req.user.id)
+      .catch(err => console.error('[ai] could not record chat answer:', err));
+  }
+
   const stream = openStream(res);
+
+  let answerText = '';
+  let currentTurn = null;
+  let settled = false;
+  let deadline = null;
+
+  /** Record how the question ended and tell the page, once. */
+  const settle = async ({ error = null, extra = {} } = {}) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadline);
+    if (answerId) {
+      await ai.finishChatAnswer(answerId, { content: answerText, error })
+        .catch(err => console.error('[ai] could not save chat answer:', err));
+    }
+    if (error) stream.send('error', { error, ...extra });
+    else stream.send('done', { text: answerText, ...extra });
+    stream.end();
+  };
+
+  deadline = setTimeout(() => {
+    settle({ error: 'That took too long to answer. Try asking about one department or a shorter period.' });
+    currentTurn?.abort();   // stop paying for a turn nobody will see
+  }, CHAT_DEADLINE_MS);
 
   let client;
   try {
     client = ai.getClient();
   } catch (err) {
-    return stream.fail(err);
+    return settle({ error: err.message });
   }
 
-  let emittedText = false;
-  let currentTurn = null;
-  const deadline = setTimeout(() => {
-    stream.send('error', {
-      error: 'That took too long to answer. Try asking about one department or a shorter period.',
-    });
-    stream.end();
-    currentTurn?.abort();   // stop paying for a turn nobody will see
-  }, CHAT_DEADLINE_MS);
-  stream.onAbort(() => { clearTimeout(deadline); currentTurn?.abort(); });
-
+  /* A page that disconnects does not stop the answer. Its stream may have
+     dropped rather than been closed on purpose, and the page will come back
+     for the saved answer. The deadline above still bounds the cost. */
   try {
     for (let i = 0; i < MAX_CHAT_ITERATIONS; i++) {
-      if (stream.closed) return;
+      if (settled) return;
 
       const turn = client.beta.messages.stream({
         model: ai.MODEL,
@@ -810,25 +837,24 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
       });
 
       currentTurn = turn;
-      turn.on('text', (delta) => { emittedText = true; stream.send('delta', { text: delta }); });
+      turn.on('text', (delta) => { answerText += delta; stream.send('delta', { text: delta }); });
 
       const message = await turn.finalMessage();
-      if (stream.closed) return;
+      if (settled) return;
 
       const toolUses = message.content.filter(b => b.type === 'tool_use');
       console.log(
         `[ai] chat turn ${i + 1}: stop=${message.stop_reason} `
         + `tools=${toolUses.map(t => t.name).join(',') || 'none'} `
-        + `text=${emittedText} in=${message.usage?.input_tokens} out=${message.usage?.output_tokens} `
-        + `cache_read=${message.usage?.cache_read_input_tokens ?? 0}`
+        + `text=${answerText.length > 0} in=${message.usage?.input_tokens} out=${message.usage?.output_tokens} `
+        + `cache_read=${message.usage?.cache_read_input_tokens ?? 0} client=${stream.closed ? 'gone' : 'connected'}`
       );
 
       if (message.stop_reason === 'refusal') {
-        stream.send('error', {
+        return settle({
           error: 'Claude declined to answer that.',
-          category: message.stop_details?.category || null,
+          extra: { category: message.stop_details?.category || null },
         });
-        return stream.end();
       }
 
       messages.push({ role: 'assistant', content: ai.sanitizeForEcho(message.content) });
@@ -836,16 +862,14 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
       if (!toolUses.length) {
         // A turn that ran out of budget mid-thought returns no text and no tool
         // call. Without this the UI would show an empty bubble and look hung.
-        if (!emittedText) {
-          stream.send('error', {
+        if (!answerText) {
+          return settle({
             error: message.stop_reason === 'max_tokens'
               ? 'Ran out of room before answering. Try a narrower question.'
               : `No answer came back (stop reason: ${message.stop_reason}).`,
           });
-          return stream.end();
         }
-        stream.send('done', { model: message.model, usage: message.usage });
-        return stream.end();
+        return settle({ extra: { model: message.model, usage: message.usage } });
       }
 
       const results = [];
@@ -877,14 +901,22 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
       messages.push({ role: 'user', content: results });
     }
 
-    stream.send('error', { error: 'Gave up after too many lookups. Try a narrower question.' });
-    stream.end();
+    await settle({ error: 'Gave up after too many lookups. Try a narrower question.' });
   } catch (err) {
-    if (stream.closed) return;   // aborted by the client, not a real failure
+    if (settled) return;   // the deadline aborted the turn and already answered
     console.error('[ai] chat failed:', err);
-    stream.fail(err);
-  } finally {
-    clearTimeout(deadline);
+    await settle({ error: err?.message || 'Generation failed' });
+  }
+});
+
+/** Collect an answer whose stream broke on the way to the page. */
+router.get('/chat/:id', verifyToken, async (req, res) => {
+  try {
+    const answer = await ai.getChatAnswer(req.params.id, req.user.id, CHAT_DEADLINE_MS + 30000);
+    if (!answer) return res.status(404).json({ error: 'No such answer' });
+    res.json(answer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
