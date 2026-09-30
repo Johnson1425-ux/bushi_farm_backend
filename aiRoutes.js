@@ -59,11 +59,21 @@ function openStream(res) {
   let closed = false;
   const abortHandlers = [];
 
+  /* While the model is thinking or a tool is running, nothing is written for
+     long stretches. Proxies between here and the browser (the app's /api
+     rewrite among them) drop a connection that sits silent, and the browser
+     is then left waiting on a stream that will never finish. An SSE comment
+     line every 15 seconds keeps it open; the client ignores it. */
+  const keepAlive = setInterval(() => {
+    if (!closed) res.write(': ping\n\n');
+  }, 15000);
+
   /* The client-went-away signal must come from the RESPONSE, not the request.
      Since Node 16, `req` emits 'close' as soon as the request body has been
      fully read — for a small JSON POST that is immediately — so listening on
      `req` would mark every stream dead before it wrote a single byte. */
   res.on('close', () => {
+    clearInterval(keepAlive);
     if (closed) return;            // we ended it ourselves; nothing to abort
     closed = true;
     for (const fn of abortHandlers) {
@@ -76,6 +86,7 @@ function openStream(res) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
   const end = () => {
+    clearInterval(keepAlive);
     if (closed) return;
     closed = true;
     res.end();
@@ -571,7 +582,10 @@ const CHAT_TOOLS = [
       + 'breeding, sales, what was spent and on what, inventory, and the processing unit. '
       + 'Call this for any question '
       + 'about what happened over a period, comparisons between periods, or farm-wide '
-      + 'totals. Request only the sections you need — each one costs tokens.',
+      + 'totals. Always pass sections, naming only the ones the question is about — a '
+      + 'question about sales needs ["sales"] and nothing else. Omitting it returns the '
+      + 'whole farm, which is slow and should only be done when the question really is '
+      + 'about the whole farm.',
     input_schema: {
       type: 'object',
       properties: {
@@ -696,18 +710,44 @@ async function runChatTool(name, input) {
 const CHAT_SYSTEM = `
 You are answering questions about Milktrack's records using the tools provided.
 
+Scope:
+- Answer only what was asked. A question about sales gets sales figures — not
+  production, health, stock or processing, even if you fetched them or they
+  look interesting. Do not add a farm overview, context from other departments,
+  or recommendations nobody asked for.
+- Fetch only what the question needs. For get_farm_data, always pass sections
+  and name only the departments the question is about.
 - Always fetch data before answering. Never answer a factual question about the
   farm from memory or from earlier turns alone if a tool can confirm it.
 - Today's date is available to you in the user turn. Resolve relative dates
   ("last month", "this week") against it before calling a tool.
-- Answer in prose. Use a short Markdown table only when the answer is genuinely
-  a list of comparable rows, and keep explanation in the surrounding sentences
-  rather than inside cells.
-- Give the numbers. "Bella averaged 14.2 litres" beats "Bella did well".
+
+Format:
+- Put figures in a Markdown table whenever the answer has more than one row of
+  comparable figures — per cow, per product, per customer, per day, per
+  category. Keep cells to figures and short labels.
+- Where the figures add up, end the table with a **Total** row. Give totals and
+  averages whenever the data supports them.
+- Outside the table, one or two sentences at most: the headline figure first,
+  then anything the reader must know to read the table correctly (a thin
+  sample, a missing upload).
+- A question with a single figure for an answer gets one sentence, no table.
+- Keep the whole answer short. No headings, no closing summary, no restating
+  the table in prose.
 - If the data does not answer the question, say exactly what is missing and
   which page of the app would let someone record it. Do not speculate.
-- Keep answers short. Most questions deserve two to four sentences.
 `.trim();
+
+/* A tool result is replayed to the model on every later turn of the same
+   question, so one oversized result makes every following turn slower and
+   can push a turn past the output budget before it answers. Past this size
+   the result is cut and the model is told to narrow the request. */
+const MAX_TOOL_RESULT_CHARS = 60000;
+
+/* The longest one question may take before the server gives up and says so,
+   rather than leaving the chat waiting on a function the host is about to
+   kill. Kept under the backend's function time limit. */
+const CHAT_DEADLINE_MS = 240000;
 
 const MAX_CHAT_ITERATIONS = 8;
 
@@ -738,6 +778,15 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
   }
 
   let emittedText = false;
+  let currentTurn = null;
+  const deadline = setTimeout(() => {
+    stream.send('error', {
+      error: 'That took too long to answer. Try asking about one department or a shorter period.',
+    });
+    stream.end();
+    currentTurn?.abort();   // stop paying for a turn nobody will see
+  }, CHAT_DEADLINE_MS);
+  stream.onAbort(() => { clearTimeout(deadline); currentTurn?.abort(); });
 
   try {
     for (let i = 0; i < MAX_CHAT_ITERATIONS; i++) {
@@ -760,7 +809,7 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
         messages,
       });
 
-      stream.onAbort(() => turn.abort());
+      currentTurn = turn;
       turn.on('text', (delta) => { emittedText = true; stream.send('delta', { text: delta }); });
 
       const message = await turn.finalMessage();
@@ -804,8 +853,12 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
         stream.send('tool', { name: call.name, input: call.input });
         try {
           const data = await runChatTool(call.name, call.input);
-          const payload = JSON.stringify(data);
+          let payload = JSON.stringify(data);
           console.log(`[ai]   ${call.name} -> ${(payload.length / 1024).toFixed(1)} KB`);
+          if (payload.length > MAX_TOOL_RESULT_CHARS) {
+            payload = payload.slice(0, MAX_TOOL_RESULT_CHARS)
+              + '\n[Result cut short: too large. Ask again for fewer sections or a shorter period.]';
+          }
           results.push({
             type: 'tool_result',
             tool_use_id: call.id,
@@ -830,6 +883,8 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
     if (stream.closed) return;   // aborted by the client, not a real failure
     console.error('[ai] chat failed:', err);
     stream.fail(err);
+  } finally {
+    clearTimeout(deadline);
   }
 });
 
