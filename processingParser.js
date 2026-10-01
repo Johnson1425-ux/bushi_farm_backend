@@ -192,6 +192,10 @@ function readTemplateRows(ws, row, handler, ctx) {
        one product is never seen, and the loop would read the total as a
        second unknown product and report it, burying the real problem. */
     if (/^TOTAL\b/.test(norm(product)) && !size.trim()) break;
+    /* The fresh-milk line under the opening balance. Also normally never
+       reached, but a catalogue product the sheet predates leaves the loop
+       still looking, and it would report this line as an unknown product. */
+    if (canonical(product) === 'FRESH MILK' && !cat.lookup(product, size)) break;
 
     const entry = cat.lookup(product, size);
     if (!entry) {
@@ -207,8 +211,8 @@ function readTemplateRows(ws, row, handler, ctx) {
       );
       if (ctx.out) {
         let units = 0;
-        for (let d = 1; d <= MAX_DAYS; d++) {
-          const v = numAt(ws, DAY_COL_START + d - 1, row);
+        for (const [col] of ctx.dayCols || []) {
+          const v = numAt(ws, col, row);
           if (typeof v === 'number' && v > 0) units += v;
         }
         noteUnknown(ctx.out, { sheet: ctx.sheet, row, product, size, section: ctx.section, units });
@@ -258,13 +262,43 @@ function parseTemplateSheet(ws, sheetName, out, cat) {
   }
 
   const period = { month, monthNum: MONTHS[month], year: yearNum };
+
+  /* A sheet copied for a new month keeps the old month in C1 unless someone
+     changes it. Imported as written, it would replace that month's figures
+     with the new month's, so a tab name and C1 that disagree are refused. */
+  const named = monthFromSheetName(sheetName);
+  if (named && (named.month !== period.month || named.year !== period.year)) {
+    out.errors.push(
+      `[${sheetName}] the tab is named ${named.month} ${named.year}, but cells C${anchors.META}/E${anchors.META} `
+      + `say ${period.month} ${period.year}. Correct whichever is wrong and upload again.`
+    );
+    return true;
+  }
+  const label = `${period.month} ${period.year}`;
+  const already = out.months.find(x => x.label === label);
+  if (already) {
+    out.errors.push(`[${sheetName}] ${label} is also on sheet "${already.sheets[0]}". Each month can only be uploaded once.`);
+    return true;
+  }
   const m = emptyMonth(period, sheetName, 'template');
   const days = daysInMonth(period.monthNum, period.year);
-  const ctx = { sheet: sheetName, section: '', errors: out.errors, warnings: out.warnings, cat, out };
+  const ctx = { sheet: sheetName, section: '', errors: out.errors, warnings: out.warnings, cat, out, dayCols: [] };
+
+  /* Which column holds which day, read from the block's own header strip.
+     The template has 31 day columns, but an operator who deletes the ones a
+     short month does not need shifts TOTAL left into day 31's place — read
+     by position, that total would land on a day that does not exist. A
+     header that cannot be read falls back to the template's fixed layout. */
+  const rng = decodeRange(ws);
+  const fixedCols = Array.from({ length: MAX_DAYS }, (_, i) => [DAY_COL_START + i, i + 1]);
+  const dayColsAt = (headerRow) => {
+    const h = readDayHeader(ws, headerRow, rng.e.c + 1);
+    return h ? [...h.colToDay] : fixedCols;
+  };
 
   /* Reads one day cell, rejecting negatives and flagging junk text. */
-  const dayValue = (row, day, what) => {
-    const v = numAt(ws, DAY_COL_START + day - 1, row);
+  const dayValue = (row, col, day, what) => {
+    const v = numAt(ws, col, row);
     if (v == null) return 0;
     if (typeof v === 'object') {
       out.warnings.push(`[${sheetName}/${ctx.section}] ${what} day ${day}: ignored "${v.bad}" — not a number.`);
@@ -302,14 +336,15 @@ function parseTemplateSheet(ws, sheetName, out, cat) {
     out.errors.push(`[${sheetName}] the MILK RECEIVED section marker is missing — column A was edited or the block was deleted.`);
   } else {
     ctx.section = 'RECEIVED';
+    ctx.dayCols = dayColsAt(anchors.RECEIVED + 1);
     let row = anchors.RECEIVED + 2;
     const seen = new Set();
     for (let i = 0; i < RECEIVED_SOURCES.length; i++, row++) {
       const src = canonical(strAt(ws, 3, row));
       if (!SOURCE_SET.has(src)) break;
       seen.add(src);
-      for (let d = 1; d <= MAX_DAYS; d++) {
-        const litres = dayValue(row, d, src);
+      for (const [col, d] of ctx.dayCols) {
+        const litres = dayValue(row, col, d, src);
         if (litres) m.received.push({ day: d, source: src, litres });
       }
     }
@@ -338,9 +373,10 @@ function parseTemplateSheet(ws, sheetName, out, cat) {
       continue;
     }
     ctx.section = section;
+    ctx.dayCols = dayColsAt(anchorRow + 1);
     readTemplateRows(ws, anchorRow + 2, (entry, r) => {
-      for (let d = 1; d <= MAX_DAYS; d++) {
-        const units = dayValue(r, d, `${entry.product} ${entry.size}`);
+      for (const [col, d] of ctx.dayCols) {
+        const units = dayValue(r, col, d, `${entry.product} ${entry.size}`);
         pushPack(m, section, { day: d, ...entry, units }, cat);
       }
     }, ctx);
@@ -349,9 +385,10 @@ function parseTemplateSheet(ws, sheetName, out, cat) {
   /* ── fresh milk damaged ── */
   if (anchors.FRESHDAMAGE) {
     ctx.section = 'FRESH MILK DAMAGED';
+    ctx.dayCols = dayColsAt(anchors.FRESHDAMAGE + 1);
     const row = anchors.FRESHDAMAGE + 2;
-    for (let d = 1; d <= MAX_DAYS; d++) {
-      const litres = dayValue(row, d, 'fresh milk');
+    for (const [col, d] of ctx.dayCols) {
+      const litres = dayValue(row, col, d, 'fresh milk');
       if (litres) m.freshDamage.push({ day: d, litres });
     }
   }
