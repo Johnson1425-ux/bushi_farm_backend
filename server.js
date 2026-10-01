@@ -37,6 +37,7 @@ const calvesRoutes      = require('./routes/calves');
 const alertsRoutes      = require('./routes/alerts');
 const salesRoutes       = require('./routes/sales');
 const salesBookRoutes   = require('./routes/salesBook');
+const unitsSoldRoutes   = require('./routes/unitsSold');
 const inventoryRoutes   = require('./routes/inventory');
 const processingRoutes  = require('./routes/processing');
 const healthRecordsRoutes = require('./routes/healthRecords');
@@ -148,6 +149,8 @@ app.use('/api/sales',      verifyToken, requireProduction, salesRoutes);
 /* The sales day book, read in from the workbook until the sales people
    record in the app. Management's, like the reports it sits beside. */
 app.use('/api/sales-book', verifyToken, requireProduction, salesBookRoutes);
+/* Litres and units sold, from the UNIT SOLD workbook. Same readers. */
+app.use('/api/units-sold', verifyToken, requireProduction, unitsSoldRoutes);
 app.use('/api/inventory',  verifyToken, requireProduction, inventoryRoutes);
 app.use('/api/processing', verifyToken, requireProduction, processingRoutes);
 app.use('/api/import',     verifyToken, requireProduction, importRoutes);

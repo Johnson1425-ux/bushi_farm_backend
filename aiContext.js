@@ -324,7 +324,7 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
     FROM selected
   `;
 
-  const [totals, prevTotals, daily, byBranch, byTier, legacy, book] = await Promise.all([
+  const [totals, prevTotals, daily, byBranch, byTier, legacy, book, sold] = await Promise.all([
     pool.query(totalsSql, [from, to]),
     pool.query(totalsSql, [prevFrom, prevTo]),
     pool.query(`
@@ -364,13 +364,20 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
        routes/salesBook.js. A month known only as a monthly figure is
        dated to its 1st. */
     pool.query(`
-      SELECT e.unit, e.unit_kind AS kind,
-             ROUND(SUM(e.amount)::numeric, 2) AS amount,
-             BOOL_OR(e.whole_month)           AS includes_whole_months,
-             (SELECT ROUND(SUM(i.litres)::numeric, 1) FROM sales_book_items i
-               WHERE i.unit = e.unit AND i.entry_date BETWEEN $1 AND $2) AS litres
-      FROM sales_book_entries e WHERE e.entry_date BETWEEN $1 AND $2
-      GROUP BY e.unit, e.unit_kind ORDER BY amount DESC
+      SELECT unit, unit_kind AS kind,
+             ROUND(SUM(amount)::numeric, 2) AS amount,
+             BOOL_OR(whole_month)           AS includes_whole_months
+      FROM sales_book_entries WHERE entry_date BETWEEN $1 AND $2
+      GROUP BY unit, unit_kind ORDER BY amount DESC
+    `, [from, to]),
+    /* Litres, from the UNIT SOLD workbook: fresh milk by outlet, processed
+       milk by product and pack. */
+    pool.query(`
+      SELECT section, item, pack,
+             ROUND(SUM(litres)::numeric, 1) AS litres,
+             ROUND(SUM(units)::numeric, 1)  AS units
+      FROM units_sold_lines WHERE entry_date BETWEEN $1 AND $2
+      GROUP BY section, item, pack ORDER BY section, litres DESC
     `, [from, to]),
   ]);
 
@@ -409,11 +416,21 @@ async function salesContext({ from, to, prevFrom, prevTo }) {
             ? ' Some months are known only as a whole-month figure, counted in full if the period includes their 1st.'
             : ''),
       total: num(book.rows.reduce((a, r) => a + num(r.amount), 0)),
-      /* Litres only for the days that have a day book; null means none
-         was kept, not that nothing was sold. */
-      by_unit: book.rows.map(r => ({
-        unit: r.unit, kind: r.kind, amount: num(r.amount),
-        litres_from_day_books: r.litres === null ? null : num(r.litres),
+      by_unit: book.rows.map(r => ({ unit: r.unit, kind: r.kind, amount: num(r.amount) })),
+    };
+  }
+
+  if (sold.rows.length) {
+    const sum = (sec) => num(sold.rows.filter(r => r.section === sec).reduce((a, r) => a + num(r.litres), 0));
+    out.litres_sold = {
+      note: 'Litres sold, from the farm\'s UNIT SOLD workbook. Fresh milk is by outlet (the shops and the '
+          + 'bulk buyers); processed milk is the whole farm\'s, by product and pack, with units worked out '
+          + 'from the pack size. Not split by sales person.',
+      fresh_litres: sum('fresh'),
+      processed_litres: sum('processed'),
+      fresh_by_outlet: sold.rows.filter(r => r.section === 'fresh').map(r => ({ outlet: r.item, litres: num(r.litres) })),
+      processed_by_pack: sold.rows.filter(r => r.section === 'processed').map(r => ({
+        product: r.item, pack: r.pack, litres: num(r.litres), units: r.units === null ? null : num(r.units),
       })),
     };
   }
