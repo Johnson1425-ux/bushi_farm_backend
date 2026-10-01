@@ -2,7 +2,9 @@ const express = require('express');
 const multer  = require('multer');
 const { pool } = require('../db');
 const { parseSalesWorkbook, UNIT_ORDER } = require('../lib/salesWorkbook');
-const { monthLabel } = require('../lib/expenseCatalog');
+const { monthLabel, norm } = require('../lib/expenseCatalog');
+const XLSX = require('xlsx');
+const { importUnitsSold } = require('./unitsSold');
 
 const router = express.Router();
 const upload = multer({
@@ -78,7 +80,7 @@ router.get('/imports', async (req, res) => {
  *
  * An earlier upload left with nothing in it is removed.
  */
-router.post('/import', upload.single('file'), async (req, res) => {
+async function importSalesBook(req, res) {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
   const parsed = parseSalesWorkbook(req.file.buffer);
@@ -204,6 +206,44 @@ router.post('/import', upload.single('file'), async (req, res) => {
   } finally {
     client.release();
   }
+}
+router.post('/import', upload.single('file'), importSalesBook);
+
+/**
+ * One upload for both workbooks.
+ *
+ * The farm keeps two: the sales day book (shillings, "<MONTH> SALES BY
+ * UNITY" sheets) and the UNIT SOLD workbook (litres, a sheet per month
+ * named JAN, FEBRUARY …). Asking which is which at upload time is a
+ * question somebody eventually answers wrong, so the sheet names decide
+ * it. Sales sheets are looked for first: their names begin with a month
+ * too ("JUNE SALES BY UNITY"), and would otherwise pass for a month sheet.
+ */
+router.post('/upload', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  let names;
+  try {
+    names = XLSX.read(req.file.buffer, { type: 'buffer', bookSheets: true }).SheetNames;
+  } catch (err) {
+    return res.status(422).json({ error: 'The file could not be opened as a spreadsheet.', issues: [err.message] });
+  }
+  const n = names.map(norm);
+  const kind = n.some(x => x.includes('SALES') && x.includes('UNIT')) ? 'sales'
+    : n.some(x => /^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)/.test(x)) ? 'units'
+    : null;
+  if (!kind) {
+    return res.status(422).json({
+      error: 'This does not look like either of the farm\'s workbooks.',
+      issues: [
+        'The sales workbook has sheets called "<MONTH> SALES BY UNITY"; the UNIT SOLD workbook has a sheet per '
+        + `month (JAN, FEBRUARY …). Sheets in this file: ${names.join(', ') || 'none'}.`,
+      ],
+    });
+  }
+  /* The answer says which it was read as, so the page can show the right summary. */
+  const json = res.json.bind(res);
+  res.json = (body) => json({ ...body, kind });
+  return kind === 'sales' ? importSalesBook(req, res) : importUnitsSold(req, res);
 });
 
 router.delete('/imports/:id', async (req, res) => {
