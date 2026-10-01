@@ -74,7 +74,7 @@ router.get('/imports', async (req, res) => {
  * month it carries replaces whatever was held for that month — from any
  * earlier upload — and an upload left with nothing is removed.
  */
-router.post('/import', upload.single('file'), async (req, res) => {
+async function importUnitsSold(req, res) {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
   const parsed = parseUnitsSoldWorkbook(req.file.buffer, { filename: req.file.originalname });
@@ -139,7 +139,8 @@ router.post('/import', upload.single('file'), async (req, res) => {
   } finally {
     client.release();
   }
-});
+}
+router.post('/import', upload.single('file'), importUnitsSold);
 
 router.delete('/imports/:id', async (req, res) => {
   try {
@@ -292,3 +293,6 @@ router.get('/day', async (req, res) => {
 });
 
 module.exports = router;
+/* The Workbooks tab has one upload for both workbooks; routes/salesBook.js
+   tells them apart and hands a UNIT SOLD workbook on to this. */
+module.exports.importUnitsSold = importUnitsSold;
