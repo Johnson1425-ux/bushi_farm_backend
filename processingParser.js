@@ -38,8 +38,8 @@
 
 const XLSX = require('xlsx');
 const {
-  RECEIVED_SOURCES, PRODUCT_ROWS, MONTHS,
-  norm, canonical, lookupProductRow, litresFor, daysInMonth,
+  RECEIVED_SOURCES, MONTHS, DEFAULT_CATALOGUE,
+  norm, canonical, buildCatalogue, guessLitresPerPack, daysInMonth,
 } = require('./processingCatalog');
 
 const MAX_DAYS = 31;
@@ -127,11 +127,31 @@ function emptyMonth(period, sheetName, source) {
 const SECTION_KEY = { PACKED: 'packed', ISSUED: 'issued', DAMAGED: 'damaged' };
 
 /** Record one pack figure, deriving litres from the size. */
-function pushPack(month, section, { day, product, size, units }) {
+function pushPack(month, section, { day, product, size, units }, cat) {
   if (!units) return;
   month[SECTION_KEY[section]].push({
-    day, product, size, units, litres: litresFor(size, units),
+    day, product, size, units, litres: cat.litresFor(size, units, product),
   });
+}
+
+/* Products on a sheet that the catalogue does not know, collected across the
+   whole workbook so the upload screen can list each once and offer to add
+   it. Keyed on the canonical spelling, so "Greek yoghurt 1L" on two month
+   sheets is one product, not two. */
+function noteUnknown(out, { sheet, row, product, size, section, units }) {
+  const key = `${canonical(product)}|${canonical(size)}`;
+  let u = out.unknownByKey.get(key);
+  if (!u) {
+    u = {
+      product: norm(product), size: norm(size),
+      litres_per_pack: guessLitresPerPack(size),
+      found_on: [], packed: 0, issued: 0, damaged: 0,
+    };
+    out.unknownByKey.set(key, u);
+  }
+  const where = `${sheet} row ${row}`;
+  if (!u.found_on.includes(where)) u.found_on.push(where);
+  if (section && SECTION_KEY[section]) u[SECTION_KEY[section]] += units || 0;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -161,18 +181,42 @@ function findAnchors(ws) {
  * missing size imports as zero, which is what it is.
  */
 function readTemplateRows(ws, row, handler, ctx) {
+  const { cat } = ctx;
   const seen = new Set();
-  while (seen.size < PRODUCT_ROWS.length) {
+  while (seen.size < cat.rows.length) {
     const product = strAt(ws, 2, row);
     const size = strAt(ws, 3, row);
     if (!product.trim() && !size.trim()) break;          // end of block
+    /* The block's own total line. Normally never reached — the loop stops
+       once every product has been seen — but when a label has been edited
+       one product is never seen, and the loop would read the total as a
+       second unknown product and report it, burying the real problem. */
+    if (/^TOTAL\b/.test(norm(product)) && !size.trim()) break;
+    /* The fresh-milk line under the opening balance. Also normally never
+       reached, but a catalogue product the sheet predates leaves the loop
+       still looking, and it would report this line as an unknown product. */
+    if (canonical(product) === 'FRESH MILK' && !cat.lookup(product, size)) break;
 
-    const entry = lookupProductRow(product, size);
+    const entry = cat.lookup(product, size);
     if (!entry) {
+      /* Refused rather than skipped: on the template a label nobody
+         recognises is far more often an overtyped one than a new product,
+         and guessing wrong either way loses a month of figures. The row is
+         still reported by name, so a genuinely new product can be added
+         and the month uploaded again. */
       ctx.errors.push(
         `[${ctx.sheet}/${ctx.section}] row ${row} reads "${product} / ${size}", which is not a product `
-        + `this app knows. Restore the original label, or download a fresh template.`
+        + `this app knows. If it is new, add it as a product and upload again; otherwise restore `
+        + `the original label, or download a fresh template.`
       );
+      if (ctx.out) {
+        let units = 0;
+        for (const [col] of ctx.dayCols || []) {
+          const v = numAt(ws, col, row);
+          if (typeof v === 'number' && v > 0) units += v;
+        }
+        noteUnknown(ctx.out, { sheet: ctx.sheet, row, product, size, section: ctx.section, units });
+      }
       row++;
       continue;
     }
@@ -187,7 +231,9 @@ function readTemplateRows(ws, row, handler, ctx) {
     row++;
   }
 
-  const missing = PRODUCT_ROWS.filter(r => !seen.has(`${r.product}|${r.size}`));
+  /* Only products still being made: a line that has been retired is
+     expected to be absent from a new sheet. */
+  const missing = cat.activeRows.filter(r => !seen.has(`${r.product}|${r.size}`));
   if (missing.length) {
     ctx.warnings.push(
       `[${ctx.sheet}/${ctx.section}] this sheet has no row for `
@@ -198,7 +244,7 @@ function readTemplateRows(ws, row, handler, ctx) {
   return row;
 }
 
-function parseTemplateSheet(ws, sheetName, out) {
+function parseTemplateSheet(ws, sheetName, out, cat) {
   const anchors = findAnchors(ws);
   if (!anchors.META) return false;   // not a template sheet
 
@@ -216,13 +262,43 @@ function parseTemplateSheet(ws, sheetName, out) {
   }
 
   const period = { month, monthNum: MONTHS[month], year: yearNum };
+
+  /* A sheet copied for a new month keeps the old month in C1 unless someone
+     changes it. Imported as written, it would replace that month's figures
+     with the new month's, so a tab name and C1 that disagree are refused. */
+  const named = monthFromSheetName(sheetName);
+  if (named && (named.month !== period.month || named.year !== period.year)) {
+    out.errors.push(
+      `[${sheetName}] the tab is named ${named.month} ${named.year}, but cells C${anchors.META}/E${anchors.META} `
+      + `say ${period.month} ${period.year}. Correct whichever is wrong and upload again.`
+    );
+    return true;
+  }
+  const label = `${period.month} ${period.year}`;
+  const already = out.months.find(x => x.label === label);
+  if (already) {
+    out.errors.push(`[${sheetName}] ${label} is also on sheet "${already.sheets[0]}". Each month can only be uploaded once.`);
+    return true;
+  }
   const m = emptyMonth(period, sheetName, 'template');
   const days = daysInMonth(period.monthNum, period.year);
-  const ctx = { sheet: sheetName, section: '', errors: out.errors, warnings: out.warnings };
+  const ctx = { sheet: sheetName, section: '', errors: out.errors, warnings: out.warnings, cat, out, dayCols: [] };
+
+  /* Which column holds which day, read from the block's own header strip.
+     The template has 31 day columns, but an operator who deletes the ones a
+     short month does not need shifts TOTAL left into day 31's place — read
+     by position, that total would land on a day that does not exist. A
+     header that cannot be read falls back to the template's fixed layout. */
+  const rng = decodeRange(ws);
+  const fixedCols = Array.from({ length: MAX_DAYS }, (_, i) => [DAY_COL_START + i, i + 1]);
+  const dayColsAt = (headerRow) => {
+    const h = readDayHeader(ws, headerRow, rng.e.c + 1);
+    return h ? [...h.colToDay] : fixedCols;
+  };
 
   /* Reads one day cell, rejecting negatives and flagging junk text. */
-  const dayValue = (row, day, what) => {
-    const v = numAt(ws, DAY_COL_START + day - 1, row);
+  const dayValue = (row, col, day, what) => {
+    const v = numAt(ws, col, row);
     if (v == null) return 0;
     if (typeof v === 'object') {
       out.warnings.push(`[${sheetName}/${ctx.section}] ${what} day ${day}: ignored "${v.bad}" — not a number.`);
@@ -246,7 +322,7 @@ function parseTemplateSheet(ws, sheetName, out) {
     row = readTemplateRows(ws, row, (entry, r) => {
       const v = numAt(ws, DAY_COL_START, r);
       const units = typeof v === 'number' && v > 0 ? v : 0;
-      if (units) m.opening.push({ ...entry, units, litres: litresFor(entry.size, units) });
+      if (units) m.opening.push({ ...entry, units, litres: cat.litresFor(entry.size, units, entry.product) });
     }, ctx);
     // The fresh-milk line sits directly under the product rows.
     if (canonical(strAt(ws, 2, row)) === 'FRESH MILK') {
@@ -260,14 +336,15 @@ function parseTemplateSheet(ws, sheetName, out) {
     out.errors.push(`[${sheetName}] the MILK RECEIVED section marker is missing — column A was edited or the block was deleted.`);
   } else {
     ctx.section = 'RECEIVED';
+    ctx.dayCols = dayColsAt(anchors.RECEIVED + 1);
     let row = anchors.RECEIVED + 2;
     const seen = new Set();
     for (let i = 0; i < RECEIVED_SOURCES.length; i++, row++) {
       const src = canonical(strAt(ws, 3, row));
       if (!SOURCE_SET.has(src)) break;
       seen.add(src);
-      for (let d = 1; d <= MAX_DAYS; d++) {
-        const litres = dayValue(row, d, src);
+      for (const [col, d] of ctx.dayCols) {
+        const litres = dayValue(row, col, d, src);
         if (litres) m.received.push({ day: d, source: src, litres });
       }
     }
@@ -296,10 +373,11 @@ function parseTemplateSheet(ws, sheetName, out) {
       continue;
     }
     ctx.section = section;
+    ctx.dayCols = dayColsAt(anchorRow + 1);
     readTemplateRows(ws, anchorRow + 2, (entry, r) => {
-      for (let d = 1; d <= MAX_DAYS; d++) {
-        const units = dayValue(r, d, `${entry.product} ${entry.size}`);
-        pushPack(m, section, { day: d, ...entry, units });
+      for (const [col, d] of ctx.dayCols) {
+        const units = dayValue(r, col, d, `${entry.product} ${entry.size}`);
+        pushPack(m, section, { day: d, ...entry, units }, cat);
       }
     }, ctx);
   }
@@ -307,9 +385,10 @@ function parseTemplateSheet(ws, sheetName, out) {
   /* ── fresh milk damaged ── */
   if (anchors.FRESHDAMAGE) {
     ctx.section = 'FRESH MILK DAMAGED';
+    ctx.dayCols = dayColsAt(anchors.FRESHDAMAGE + 1);
     const row = anchors.FRESHDAMAGE + 2;
-    for (let d = 1; d <= MAX_DAYS; d++) {
-      const litres = dayValue(row, d, 'fresh milk');
+    for (const [col, d] of ctx.dayCols) {
+      const litres = dayValue(row, col, d, 'fresh milk');
       if (litres) m.freshDamage.push({ day: d, litres });
     }
   }
@@ -363,6 +442,21 @@ function classifyBlock(bannerText, sheetIsDamage) {
 }
 
 /**
+ * Column C reads like a pack size — "1L", "150ML", "0.5 CHUPA", "PACT O.5L" —
+ * whether or not the catalogue knows it.
+ *
+ * This is how a product row the app has never heard of is told apart from
+ * the other things that sit in and around a block: a TOTAL line carries a
+ * number or nothing in column C, a note carries words with no quantity. A
+ * new product added to the workbook carries a size, because every product
+ * row does.
+ */
+function looksLikeSize(text) {
+  const t = norm(text);
+  return /\d/.test(t) && /(ML|L\b|LTR|LITRE|CUP|CHUPA|PACK|PACT)/.test(t);
+}
+
+/**
  * Walk a legacy sheet and return its blocks:
  *   { kind, headerRow, rows: [{ row, product, size }] }
  *
@@ -370,8 +464,16 @@ function classifyBlock(bannerText, sheetIsDamage) {
  * column B names the product only on its first row, so the product is
  * carried down. Single blank rows inside a run are tolerated — the source
  * workbook has a few, left over from deleted sizes.
+ *
+ * A row that looks like a product row but names something the catalogue
+ * does not know stays part of the block, listed under `unknown` rather
+ * than `rows`. It used to end the block instead: appended at the bottom it
+ * was then skipped without a word, and its whole month of figures vanished
+ * from an upload that reported success; placed in the middle it split the
+ * block in two, and the upload was refused for having "a second PACKED
+ * block" — true, and no help at all in finding the row that caused it.
  */
-function findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow) {
+function findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow, cat) {
   const blocks = [];
   const headers = [];        // day-header rows, in order
 
@@ -382,9 +484,26 @@ function findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow) {
 
   let r = 1;
   let lastProduct = '';
+  let prevEnd = 0;           // last row the previous block consumed
   while (r <= maxRow) {
-    const entry = lookupProductRow(strAt(ws, 2, r) || lastProduct, strAt(ws, 3, r));
+    const entry = cat.lookup(strAt(ws, 2, r) || lastProduct, strAt(ws, 3, r));
     if (!entry) { r++; lastProduct = strAt(ws, 2, r - 1) || lastProduct; continue; }
+
+    /* Unknown products sitting directly above the first known row belong to
+       this block too. Walked back only as far as the previous block, so a
+       row is never claimed twice. */
+    let first = r;
+    while (first - 1 > prevEnd
+           && looksLikeSize(strAt(ws, 3, first - 1))
+           && !cat.lookup(strAt(ws, 2, first - 1), strAt(ws, 3, first - 1))) {
+      first--;
+    }
+    const unknown = [];
+    let carried = '';
+    for (let u = first; u < r; u++) {
+      if (strAt(ws, 2, u).trim()) carried = strAt(ws, 2, u);
+      unknown.push({ row: u, product: carried.trim() || '(unnamed)', size: strAt(ws, 3, u).trim() });
+    }
 
     // Start of a run.
     const rows = [];
@@ -394,11 +513,19 @@ function findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow) {
     while (cur <= maxRow) {
       const bText = strAt(ws, 2, cur);
       if (bText.trim()) product = bText;
-      const e = lookupProductRow(product, strAt(ws, 3, cur));
+      const size = strAt(ws, 3, cur);
+      const e = cat.lookup(product, size);
       if (e) { rows.push({ row: cur, ...e }); blank = 0; cur++; continue; }
-      if (strAt(ws, 3, cur).trim() === '' && blank < 1) { blank++; cur++; continue; }
+      // Reads like a product, but not one the catalogue knows: keep it with
+      // the block so it can be reported, and keep walking.
+      if (looksLikeSize(size)) {
+        unknown.push({ row: cur, product: product.trim() || '(unnamed)', size: size.trim() });
+        blank = 0; cur++; continue;
+      }
+      if (size.trim() === '' && blank < 1) { blank++; cur++; continue; }
       break;
     }
+    prevEnd = cur - 1;
 
     /* Banner: walk up for the nearest heading that actually names a section.
        The rows immediately above a block are the day numbers and a bare
@@ -407,7 +534,7 @@ function findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow) {
     let banner = '';
     let kind = null;
     let nearestText = '';
-    for (let up = rows[0].row - 1; up >= Math.max(1, rows[0].row - 12); up--) {
+    for (let up = first - 1; up >= Math.max(1, first - 12); up--) {
       const t = rowText(ws, up, maxCol);
       if (!t) continue;
       if (readDayHeader(ws, up, maxCol)) continue;      // day numbers, not a heading
@@ -416,12 +543,13 @@ function findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow) {
       if (k) { kind = k; banner = t; break; }
     }
 
-    const header = headers.filter(h => h.row < rows[0].row).pop();
+    const header = headers.filter(h => h.row < first).pop();
     blocks.push({
       kind,
       banner: banner || nearestText,
       header,
       rows,
+      unknown,
     });
 
     r = cur;
@@ -430,7 +558,7 @@ function findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow) {
   return blocks;
 }
 
-function parseLegacySheet(ws, sheetName, period, out, monthsByLabel) {
+function parseLegacySheet(ws, sheetName, period, out, monthsByLabel, cat) {
   const rng = decodeRange(ws);
   const maxCol = rng.e.c + 1;
   const maxRow = rng.e.r + 1;
@@ -478,8 +606,12 @@ function parseLegacySheet(ws, sheetName, period, out, monthsByLabel) {
   }
 
   /* ── pack blocks ── */
-  const blocks = findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow);
+  const blocks = findLegacyBlocks(ws, sheetIsDamage, maxCol, maxRow, cat);
   const counted = { PACKED: 0, ISSUED: 0, DAMAGED: 0 };
+  /* Products on the sheet the catalogue does not know, gathered across the
+     blocks that are actually read so each is reported once, with what was
+     left out of each section. */
+  const notImported = new Map();
 
   for (const block of blocks) {
     if (block.kind === 'SKIP_LITRES' || block.kind === 'SKIP_STOCK') continue;
@@ -499,11 +631,25 @@ function parseLegacySheet(ws, sheetName, period, out, monthsByLabel) {
     if (counted[block.kind] && block.kind !== 'DAMAGED') {
       out.errors.push(
         `[${sheetName}] found a second ${block.kind} block at row ${block.rows[0].row}. `
-        + `Only one is expected per month — check the sheet before importing.`
+        + `Only one is expected per month — check the sheet before importing. If there is `
+        + `only one on the sheet, a row inside it that is not a product row (a note, or a `
+        + `line with no pack size) has split it in two.`
       );
       continue;
     }
     counted[block.kind]++;
+
+    for (const u of block.unknown) {
+      let units = 0;
+      for (const [col, day] of block.header.colToDay) {
+        const v = numAt(ws, col, u.row);
+        if (typeof v === 'number' && v > 0 && day <= days) units += v;
+      }
+      const key = `${norm(u.product)}|${norm(u.size)}`;
+      if (!notImported.has(key)) notImported.set(key, { ...u, sections: [] });
+      notImported.get(key).sections.push({ kind: block.kind, units });
+      noteUnknown(out, { sheet: sheetName, row: u.row, product: u.product, size: u.size, section: block.kind, units });
+    }
 
     for (const { row, product, size } of block.rows) {
       for (const [col, day] of block.header.colToDay) {
@@ -518,16 +664,33 @@ function parseLegacySheet(ws, sheetName, period, out, monthsByLabel) {
           out.warnings.push(`[${sheetName}] ${product} ${size}: ${period.month} has ${days} days, so the figure in day ${day} was skipped.`);
           continue;
         }
-        pushPack(m, block.kind, { day, product, size, units: v });
+        pushPack(m, block.kind, { day, product, size, units: v }, cat);
       }
       // Opening balance lives in the B/D column of the packed block.
       if (block.kind === 'PACKED' && block.header.openingCol) {
         const v = numAt(ws, block.header.openingCol, row);
         if (typeof v === 'number' && v > 0) {
-          m.opening.push({ product, size, units: v, litres: litresFor(size, v) });
+          m.opening.push({ product, size, units: v, litres: cat.litresFor(size, v, product) });
         }
       }
     }
+  }
+
+  /* A warning, not an error: the rest of the month is sound and there is no
+     reason to turn it away. But it has to be said out loud — a product's
+     figures leaving an upload that otherwise reports success is exactly how
+     a month ends up short without anyone knowing why. */
+  const LABEL = { PACKED: 'packed', ISSUED: 'issued', DAMAGED: 'damaged' };
+  for (const u of notImported.values()) {
+    const moved = u.sections.filter(x => x.units > 0);
+    const what = moved.length
+      ? moved.map(x => `${x.units} ${LABEL[x.kind]}`).join(', ')
+      : 'no figures entered';
+    out.warnings.push(
+      `[${sheetName}] "${u.product} ${u.size}" (row ${u.row}) is not a product the app knows, `
+      + `so it was not imported — ${what}. If it is new, add it as a product and upload the `
+      + `month again; if it is a misspelling of an existing product, correct it on the sheet.`
+    );
   }
 
   /* ── fresh milk written off ──
@@ -601,7 +764,7 @@ function consolidate(m) {
  * A figure below zero here means more was written off than was ever made,
  * which is a counting mistake on the sheet rather than real stock.
  */
-function computeStock(m, warnings) {
+function computeStock(m, warnings, cat) {
   const acc = new Map();
   const bump = (product, size, field, units) => {
     const k = `${product}|${size}`;
@@ -627,8 +790,8 @@ function computeStock(m, warnings) {
       ...s,
       issued: 0,
       available,
-      opening_litres: litresFor(s.size, s.opening),
-      available_litres: litresFor(s.size, available),
+      opening_litres: cat.litresFor(s.size, s.opening, s.product),
+      available_litres: cat.litresFor(s.size, available, s.product),
     };
   }).filter(s => s.opening || s.packed || s.damaged);
 
@@ -639,10 +802,23 @@ function computeStock(m, warnings) {
  * Parse a processing workbook.
  *
  * @param {Buffer} buffer  .xlsx bytes
- * @returns {{ ok:boolean, months:Array, errors:string[], warnings:string[] }}
+ * @param {object} [opts]
+ * @param {Array|object} [opts.catalogue]  the products to recognise — rows from
+ *   the products table, or a buildCatalogue() result. Defaults to the list in
+ *   processingCatalog.js.
+ * @returns {{ ok:boolean, months:Array, errors:string[], warnings:string[],
+ *             unknown_products:Array }}
  */
-function parseProcessingWorkbook(buffer) {
-  const out = { ok: false, months: [], errors: [], warnings: [] };
+function parseProcessingWorkbook(buffer, { catalogue } = {}) {
+  const cat = !catalogue ? DEFAULT_CATALOGUE
+    : typeof catalogue.lookup === 'function' ? catalogue
+    : catalogue.length ? buildCatalogue(catalogue) : DEFAULT_CATALOGUE;
+  const out = { ok: false, months: [], errors: [], warnings: [], unknown_products: [] };
+  Object.defineProperty(out, 'unknownByKey', { value: new Map(), enumerable: false });
+  const finish = () => {
+    out.unknown_products = [...out.unknownByKey.values()];
+    return out;
+  };
 
   let wb;
   try {
@@ -666,14 +842,14 @@ function parseProcessingWorkbook(buffer) {
     if (!ws) continue;
 
     // Template sheets announce themselves with ##META## in column A.
-    if (parseTemplateSheet(ws, name, out)) { handled++; continue; }
+    if (parseTemplateSheet(ws, name, out, cat)) { handled++; continue; }
 
     const period = monthFromSheetName(name);
     if (!period) {
       out.warnings.push(`Sheet "${name}" is not a month sheet (its name needs a month and a year, like "JUNE 2026") and was skipped.`);
       continue;
     }
-    parseLegacySheet(ws, name, period, out, legacyByLabel);
+    parseLegacySheet(ws, name, period, out, legacyByLabel, cat);
     handled++;
   }
 
@@ -682,12 +858,12 @@ function parseProcessingWorkbook(buffer) {
       'No usable month sheets were found. Use the "Download template" button on the Processing Unit '
       + 'page, or upload the farm workbook with its sheets named like "JUNE 2026".'
     );
-    return out;
+    return finish();
   }
 
   for (const m of out.months) {
     consolidate(m);
-    computeStock(m, out.warnings);
+    computeStock(m, out.warnings, cat);
     if (!m.received.length && !m.packed.length && !m.issued.length) {
       out.warnings.push(`[${m.label}] no figures were found on this sheet.`);
     }
@@ -701,7 +877,7 @@ function parseProcessingWorkbook(buffer) {
   }
 
   out.ok = out.errors.length === 0;
-  return out;
+  return finish();
 }
 
 module.exports = { parseProcessingWorkbook, norm };

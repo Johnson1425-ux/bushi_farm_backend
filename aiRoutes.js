@@ -11,6 +11,7 @@
    GET    /api/ai/cows/:id/summary       latest saved cow summary
    POST   /api/ai/cows/:id/summary       generate cow summary      (SSE)
    POST   /api/ai/chat                   ask-the-data chat         (SSE)
+   GET    /api/ai/chat/:id               a chat answer, if its stream broke
 
    Generation endpoints stream Server-Sent Events so the UI can render
    text as it is written instead of waiting on a long request.
@@ -59,11 +60,21 @@ function openStream(res) {
   let closed = false;
   const abortHandlers = [];
 
+  /* While the model is thinking or a tool is running, nothing is written for
+     long stretches. Proxies between here and the browser (the app's /api
+     rewrite among them) drop a connection that sits silent, and the browser
+     is then left waiting on a stream that will never finish. An SSE comment
+     line every 15 seconds keeps it open; the client ignores it. */
+  const keepAlive = setInterval(() => {
+    if (!closed) res.write(': ping\n\n');
+  }, 15000);
+
   /* The client-went-away signal must come from the RESPONSE, not the request.
      Since Node 16, `req` emits 'close' as soon as the request body has been
      fully read — for a small JSON POST that is immediately — so listening on
      `req` would mark every stream dead before it wrote a single byte. */
   res.on('close', () => {
+    clearInterval(keepAlive);
     if (closed) return;            // we ended it ourselves; nothing to abort
     closed = true;
     for (const fn of abortHandlers) {
@@ -76,6 +87,7 @@ function openStream(res) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
   const end = () => {
+    clearInterval(keepAlive);
     if (closed) return;
     closed = true;
     res.end();
@@ -571,7 +583,10 @@ const CHAT_TOOLS = [
       + 'breeding, sales, what was spent and on what, inventory, and the processing unit. '
       + 'Call this for any question '
       + 'about what happened over a period, comparisons between periods, or farm-wide '
-      + 'totals. Request only the sections you need — each one costs tokens.',
+      + 'totals. Always pass sections, naming only the ones the question is about — a '
+      + 'question about sales needs ["sales"] and nothing else. Omitting it returns the '
+      + 'whole farm, which is slow and should only be done when the question really is '
+      + 'about the whole farm.',
     input_schema: {
       type: 'object',
       properties: {
@@ -696,18 +711,44 @@ async function runChatTool(name, input) {
 const CHAT_SYSTEM = `
 You are answering questions about Milktrack's records using the tools provided.
 
+Scope:
+- Answer only what was asked. A question about sales gets sales figures — not
+  production, health, stock or processing, even if you fetched them or they
+  look interesting. Do not add a farm overview, context from other departments,
+  or recommendations nobody asked for.
+- Fetch only what the question needs. For get_farm_data, always pass sections
+  and name only the departments the question is about.
 - Always fetch data before answering. Never answer a factual question about the
   farm from memory or from earlier turns alone if a tool can confirm it.
 - Today's date is available to you in the user turn. Resolve relative dates
   ("last month", "this week") against it before calling a tool.
-- Answer in prose. Use a short Markdown table only when the answer is genuinely
-  a list of comparable rows, and keep explanation in the surrounding sentences
-  rather than inside cells.
-- Give the numbers. "Bella averaged 14.2 litres" beats "Bella did well".
+
+Format:
+- Put figures in a Markdown table whenever the answer has more than one row of
+  comparable figures — per cow, per product, per customer, per day, per
+  category. Keep cells to figures and short labels.
+- Where the figures add up, end the table with a **Total** row. Give totals and
+  averages whenever the data supports them.
+- Outside the table, one or two sentences at most: the headline figure first,
+  then anything the reader must know to read the table correctly (a thin
+  sample, a missing upload).
+- A question with a single figure for an answer gets one sentence, no table.
+- Keep the whole answer short. No headings, no closing summary, no restating
+  the table in prose.
 - If the data does not answer the question, say exactly what is missing and
   which page of the app would let someone record it. Do not speculate.
-- Keep answers short. Most questions deserve two to four sentences.
 `.trim();
+
+/* A tool result is replayed to the model on every later turn of the same
+   question, so one oversized result makes every following turn slower and
+   can push a turn past the output budget before it answers. Past this size
+   the result is cut and the model is told to narrow the request. */
+const MAX_TOOL_RESULT_CHARS = 60000;
+
+/* The longest one question may take before the server gives up and says so,
+   rather than leaving the chat waiting on a function the host is about to
+   kill. Kept under the backend's function time limit. */
+const CHAT_DEADLINE_MS = 240000;
 
 const MAX_CHAT_ITERATIONS = 8;
 
@@ -728,20 +769,55 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
     content: `Today is ${new Date().toISOString().slice(0, 10)}.\n\n${question}`,
   });
 
+  /* The page names each question so it can collect the answer later if the
+     stream breaks on the way — the server can finish while the phone never
+     hears the end of it. */
+  const rawId = req.body?.request_id;
+  const answerId = typeof rawId === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(rawId) ? rawId : null;
+  if (answerId) {
+    await ai.startChatAnswer(answerId, req.user.id)
+      .catch(err => console.error('[ai] could not record chat answer:', err));
+  }
+
   const stream = openStream(res);
+
+  let answerText = '';
+  let currentTurn = null;
+  let settled = false;
+  let deadline = null;
+
+  /** Record how the question ended and tell the page, once. */
+  const settle = async ({ error = null, extra = {} } = {}) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(deadline);
+    if (answerId) {
+      await ai.finishChatAnswer(answerId, { content: answerText, error })
+        .catch(err => console.error('[ai] could not save chat answer:', err));
+    }
+    if (error) stream.send('error', { error, ...extra });
+    else stream.send('done', { text: answerText, ...extra });
+    stream.end();
+  };
+
+  deadline = setTimeout(() => {
+    settle({ error: 'That took too long to answer. Try asking about one department or a shorter period.' });
+    currentTurn?.abort();   // stop paying for a turn nobody will see
+  }, CHAT_DEADLINE_MS);
 
   let client;
   try {
     client = ai.getClient();
   } catch (err) {
-    return stream.fail(err);
+    return settle({ error: err.message });
   }
 
-  let emittedText = false;
-
+  /* A page that disconnects does not stop the answer. Its stream may have
+     dropped rather than been closed on purpose, and the page will come back
+     for the saved answer. The deadline above still bounds the cost. */
   try {
     for (let i = 0; i < MAX_CHAT_ITERATIONS; i++) {
-      if (stream.closed) return;
+      if (settled) return;
 
       const turn = client.beta.messages.stream({
         model: ai.MODEL,
@@ -760,26 +836,25 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
         messages,
       });
 
-      stream.onAbort(() => turn.abort());
-      turn.on('text', (delta) => { emittedText = true; stream.send('delta', { text: delta }); });
+      currentTurn = turn;
+      turn.on('text', (delta) => { answerText += delta; stream.send('delta', { text: delta }); });
 
       const message = await turn.finalMessage();
-      if (stream.closed) return;
+      if (settled) return;
 
       const toolUses = message.content.filter(b => b.type === 'tool_use');
       console.log(
         `[ai] chat turn ${i + 1}: stop=${message.stop_reason} `
         + `tools=${toolUses.map(t => t.name).join(',') || 'none'} `
-        + `text=${emittedText} in=${message.usage?.input_tokens} out=${message.usage?.output_tokens} `
-        + `cache_read=${message.usage?.cache_read_input_tokens ?? 0}`
+        + `text=${answerText.length > 0} in=${message.usage?.input_tokens} out=${message.usage?.output_tokens} `
+        + `cache_read=${message.usage?.cache_read_input_tokens ?? 0} client=${stream.closed ? 'gone' : 'connected'}`
       );
 
       if (message.stop_reason === 'refusal') {
-        stream.send('error', {
+        return settle({
           error: 'Claude declined to answer that.',
-          category: message.stop_details?.category || null,
+          extra: { category: message.stop_details?.category || null },
         });
-        return stream.end();
       }
 
       messages.push({ role: 'assistant', content: ai.sanitizeForEcho(message.content) });
@@ -787,16 +862,14 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
       if (!toolUses.length) {
         // A turn that ran out of budget mid-thought returns no text and no tool
         // call. Without this the UI would show an empty bubble and look hung.
-        if (!emittedText) {
-          stream.send('error', {
+        if (!answerText) {
+          return settle({
             error: message.stop_reason === 'max_tokens'
               ? 'Ran out of room before answering. Try a narrower question.'
               : `No answer came back (stop reason: ${message.stop_reason}).`,
           });
-          return stream.end();
         }
-        stream.send('done', { model: message.model, usage: message.usage });
-        return stream.end();
+        return settle({ extra: { model: message.model, usage: message.usage } });
       }
 
       const results = [];
@@ -804,8 +877,12 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
         stream.send('tool', { name: call.name, input: call.input });
         try {
           const data = await runChatTool(call.name, call.input);
-          const payload = JSON.stringify(data);
+          let payload = JSON.stringify(data);
           console.log(`[ai]   ${call.name} -> ${(payload.length / 1024).toFixed(1)} KB`);
+          if (payload.length > MAX_TOOL_RESULT_CHARS) {
+            payload = payload.slice(0, MAX_TOOL_RESULT_CHARS)
+              + '\n[Result cut short: too large. Ask again for fewer sections or a shorter period.]';
+          }
           results.push({
             type: 'tool_result',
             tool_use_id: call.id,
@@ -824,12 +901,22 @@ router.post('/chat', verifyToken, requireAi, async (req, res) => {
       messages.push({ role: 'user', content: results });
     }
 
-    stream.send('error', { error: 'Gave up after too many lookups. Try a narrower question.' });
-    stream.end();
+    await settle({ error: 'Gave up after too many lookups. Try a narrower question.' });
   } catch (err) {
-    if (stream.closed) return;   // aborted by the client, not a real failure
+    if (settled) return;   // the deadline aborted the turn and already answered
     console.error('[ai] chat failed:', err);
-    stream.fail(err);
+    await settle({ error: err?.message || 'Generation failed' });
+  }
+});
+
+/** Collect an answer whose stream broke on the way to the page. */
+router.get('/chat/:id', verifyToken, async (req, res) => {
+  try {
+    const answer = await ai.getChatAnswer(req.params.id, req.user.id, CHAT_DEADLINE_MS + 30000);
+    if (!answer) return res.status(404).json({ error: 'No such answer' });
+    res.json(answer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
